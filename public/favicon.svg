@@ -1,0 +1,5 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="#b42335"/>
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="none" stroke="#8f1d2c" stroke-width="2"/>
+  <text x="32" y="33" fill="#ffffff" font-size="34" font-weight="700" text-anchor="middle" dominant-baseline="central" font-family="'STSong','SimSun','Songti SC',serif">印</text>
+</svg>

@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CorpSeals · PDF 电子签章工作台</title>
+
+<!-- Fonts: distinctive serif display (Zodiak) + clean body (Satoshi) from Fontshare.
+     Chinese falls back to Songti/Noto Serif for an ink-and-seal aesthetic. -->
+<link rel="preconnect" href="https://api.fontshare.com">
+<link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=zodiak@400,500,700&f[]=satoshi@400,500,700&display=swap">
+
+<style>
+/* ===========================================
+   THEME — change these to retune the whole deck
+   印 · 朱砂红 / 墨黑 / 金 —— 取自电子印章的视觉语言
+   =========================================== */
+:root{
+  --ink:#0c0e13;            /* deepest ink background */
+  --ink-2:#13161e;          /* secondary panel */
+  --paper:#f3ece0;          /* warm paper text */
+  --paper-dim:#b8b0a3;      /* muted paper */
+  --seal:#c2362f;           /* 朱砂 vermilion seal red */
+  --seal-deep:#8f1d22;      /* deep seal red */
+  --gold:#d8ab5b;           /* metallic gold accent */
+  --gold-soft:#f0d9a6;
+
+  --font-display:'Zodiak','Songti SC','STSong','Noto Serif SC',serif;
+  --font-han:'Songti SC','STSong','Noto Serif SC',serif;
+  --font-body:'Satoshi','PingFang SC','Microsoft YaHei',sans-serif;
+
+  --ease:cubic-bezier(0.16,1,0.3,1);
+  --dur:0.7s;
+
+  /* sizing tokens (overridden by viewport-base.css for small screens) */
+  --slide-padding:clamp(1.5rem,5vw,5rem);
+  --content-gap:clamp(0.8rem,2vw,1.8rem);
+}
+
+*{margin:0;padding:0;box-sizing:border-box;}
+
+body{
+  background:var(--ink);
+  color:var(--paper);
+  font-family:var(--font-body);
+  -webkit-font-smoothing:antialiased;
+}
+
+/* ===========================================
+   VIEWPORT FITTING: MANDATORY BASE STYLES (verbatim from skill)
+   =========================================== */
+html, body { height:100%; overflow-x:hidden; }
+html { scroll-snap-type:y mandatory; scroll-behavior:smooth; }
+.slide{
+  width:100vw; height:100vh; height:100dvh;
+  overflow:hidden; scroll-snap-align:start;
+  display:flex; flex-direction:column; position:relative;
+}
+.slide-content{
+  flex:1; display:flex; flex-direction:column; justify-content:center;
+  max-height:100%; overflow:hidden; padding:var(--slide-padding);
+}
+:root{
+  --title-size:clamp(1.5rem,5vw,4rem);
+  --h2-size:clamp(1.25rem,3.5vw,2.5rem);
+  --h3-size:clamp(1rem,2.5vw,1.75rem);
+  --body-size:clamp(0.75rem,1.5vw,1.125rem);
+  --small-size:clamp(0.65rem,1vw,0.875rem);
+  --content-gap:clamp(0.5rem,2vw,2rem);
+  --element-gap:clamp(0.25rem,1vw,1rem);
+}
+.card,.container,.content-box{max-width:min(90vw,1000px);max-height:min(80vh,700px);}
+.feature-list,.bullet-list{gap:clamp(0.4rem,1vh,1rem);}
+.feature-list li,.bullet-list li{font-size:var(--body-size);line-height:1.4;}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:clamp(0.5rem,1.5vw,1rem);}
+img,.image-container{max-width:100%;max-height:min(50vh,400px);object-fit:contain;}
+@media (max-height:700px){:root{--slide-padding:clamp(0.75rem,3vw,2rem);--content-gap:clamp(0.4rem,1.5vw,1rem);--title-size:clamp(1.25rem,4.5vw,2.5rem);--h2-size:clamp(1rem,3vw,1.75rem);}}
+@media (max-height:600px){:root{--slide-padding:clamp(0.5rem,2.5vw,1.5rem);--content-gap:clamp(0.3rem,1vw,0.75rem);--title-size:clamp(1.1rem,4vw,2rem);--body-size:clamp(0.7rem,1.2vw,0.95rem);}.nav-dots,.keyboard-hint,.decorative{display:none;}}
+@media (max-height:500px){:root{--slide-padding:clamp(0.4rem,2vw,1rem);--title-size:clamp(1rem,3.5vw,1.5rem);--h2-size:clamp(0.9rem,2.5vw,1.25rem);--body-size:clamp(0.65rem,1vw,0.85rem);}}
+@media (max-width:600px){:root{--title-size:clamp(1.25rem,7vw,2.5rem);}.grid{grid-template-columns:1fr;}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:0.01ms!important;transition-duration:0.2s!important;}html{scroll-behavior:auto;}}
+
+/* ===========================================
+   ATMOSPHERE — ink paper, faint seal grid, vignette
+   =========================================== */
+.slide{
+  background:
+    radial-gradient(120% 90% at 78% 8%, rgba(194,54,47,0.10), transparent 55%),
+    radial-gradient(120% 90% at 10% 100%, rgba(216,171,91,0.08), transparent 55%),
+    linear-gradient(180deg,var(--ink),var(--ink-2));
+}
+.slide::after{ /* faint hairline frame, like a document border */
+  content:""; position:absolute; inset:clamp(10px,1.6vw,26px);
+  border:1px solid rgba(216,171,91,0.14); pointer-events:none;
+}
+/* giant ghost 印 watermark on most slides */
+.ghost{
+  position:absolute; right:clamp(-2rem,-1vw,0); bottom:clamp(-3rem,-4vw,-1rem);
+  font-family:var(--font-han); font-weight:700;
+  font-size:clamp(14rem,42vw,40rem); line-height:0.8;
+  color:rgba(243,236,224,0.03); user-select:none; pointer-events:none; z-index:0;
+}
+.slide-content{position:relative;z-index:1;}
+
+/* ===========================================
+   TYPOGRAPHY
+   =========================================== */
+.kicker{
+  font-family:var(--font-body); font-weight:700;
+  font-size:var(--small-size); letter-spacing:0.32em; text-transform:uppercase;
+  color:var(--gold); display:flex; align-items:center; gap:0.7em;
+}
+.kicker::before{content:"";width:clamp(20px,3vw,46px);height:1px;background:var(--gold);opacity:0.7;}
+h1{font-family:var(--font-display);font-weight:700;font-size:var(--title-size);line-height:1.02;letter-spacing:-0.01em;}
+h2{font-family:var(--font-display);font-weight:700;font-size:var(--h2-size);line-height:1.08;letter-spacing:-0.01em;}
+h3{font-family:var(--font-display);font-weight:500;font-size:var(--h3-size);}
+p{font-size:var(--body-size);line-height:1.6;color:var(--paper-dim);max-width:62ch;}
+.han{font-family:var(--font-han);}
+.em-red{color:var(--seal);}
+.em-gold{color:var(--gold);}
+
+/* ===========================================
+   THE SEAL MOTIF (inline, scalable) — used on title & closing
+   =========================================== */
+.seal{
+  --d:clamp(120px,22vw,260px);
+  width:var(--d); height:var(--d); position:relative; flex:0 0 auto;
+  transform:rotate(-7deg);
+}
+.seal svg{width:100%;height:100%;filter:drop-shadow(0 10px 30px rgba(194,54,47,0.35));}
+.title-seal{animation:stampIn 0.9s var(--ease) both;}
+@keyframes stampIn{
+  0%{opacity:0;transform:rotate(-22deg) scale(2.2);}
+  60%{opacity:1;transform:rotate(-4deg) scale(0.94);}
+  100%{opacity:1;transform:rotate(-7deg) scale(1);}
+}
+
+/* ===========================================
+   TITLE SLIDE
+   =========================================== */
+.title-slide .slide-content{align-items:center;text-align:center;gap:var(--content-gap);}
+.brandline{display:flex;align-items:center;gap:clamp(1rem,3vw,2.5rem);flex-wrap:wrap;justify-content:center;}
+.title-slide h1{font-size:clamp(2.6rem,9vw,7rem);}
+.title-slide h1 .sub{display:block;font-family:var(--font-han);font-weight:500;font-size:clamp(1rem,3.2vw,2.1rem);color:var(--paper-dim);letter-spacing:0.12em;margin-top:0.4em;}
+.tagline{display:inline-flex;gap:1.2em;font-family:var(--font-han);color:var(--gold-soft);font-size:clamp(0.8rem,1.8vw,1.2rem);letter-spacing:0.3em;}
+.tagline span{position:relative;}
+.tagline span+span::before{content:"·";position:absolute;left:-0.75em;color:var(--seal);}
+
+/* ===========================================
+   LAYOUTS
+   =========================================== */
+.head{display:flex;flex-direction:column;gap:0.6rem;margin-bottom:var(--content-gap);}
+.two-col{display:grid;grid-template-columns:1.05fr 0.95fr;gap:clamp(1.2rem,4vw,3.5rem);align-items:center;}
+@media (max-width:780px){.two-col{grid-template-columns:1fr;}}
+
+/* numbered big stat */
+.lead-num{font-family:var(--font-display);font-weight:700;color:var(--seal);font-size:clamp(3rem,11vw,8rem);line-height:0.9;}
+
+/* feature grid cards */
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(0.6rem,1.4vw,1.1rem);}
+@media (max-width:820px){.cards{grid-template-columns:1fr 1fr;}}
+@media (max-width:520px){.cards{grid-template-columns:1fr;}}
+.card-x{
+  background:linear-gradient(180deg,rgba(255,255,255,0.035),rgba(255,255,255,0.012));
+  border:1px solid rgba(216,171,91,0.16); border-radius:14px;
+  padding:clamp(0.8rem,1.8vw,1.4rem); display:flex; flex-direction:column; gap:0.5rem;
+  min-height:0;
+}
+.card-x .idx{font-family:var(--font-display);color:var(--gold);font-size:var(--small-size);letter-spacing:0.15em;}
+.card-x h3{font-family:var(--font-han);font-weight:700;font-size:clamp(1rem,2vw,1.4rem);color:var(--paper);}
+.card-x p{font-size:var(--small-size);line-height:1.5;}
+
+/* mode chips (three stamping modes) */
+.modes{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(0.8rem,2vw,1.6rem);}
+@media (max-width:780px){.modes{grid-template-columns:1fr;}}
+.mode{
+  border:1px solid rgba(216,171,91,0.18);border-radius:16px;
+  padding:clamp(1rem,2.4vw,1.8rem);background:rgba(255,255,255,0.02);
+  display:flex;flex-direction:column;gap:0.7rem;position:relative;overflow:hidden;
+}
+.mode .stamp-badge{
+  position:absolute;top:-10px;right:-10px;width:64px;height:64px;border-radius:50%;
+  border:2px solid var(--seal);color:var(--seal);display:grid;place-items:center;
+  font-family:var(--font-han);font-weight:700;font-size:1.4rem;transform:rotate(-12deg);opacity:0.5;
+}
+.mode h3{font-family:var(--font-han);font-weight:700;color:var(--gold-soft);font-size:clamp(1.1rem,2.4vw,1.6rem);}
+.mode p{font-size:var(--small-size);}
+
+/* bullet list with seal ticks */
+.ticks{list-style:none;display:flex;flex-direction:column;gap:clamp(0.5rem,1.4vh,1rem);max-width:60ch;}
+.ticks li{display:flex;gap:0.8em;align-items:flex-start;font-size:var(--body-size);color:var(--paper);}
+.ticks li::before{content:"印";font-family:var(--font-han);color:var(--seal);font-size:0.85em;
+  background:rgba(194,54,47,0.12);border:1px solid rgba(194,54,47,0.4);border-radius:6px;
+  width:1.7em;height:1.7em;display:grid;place-items:center;flex:0 0 auto;margin-top:0.1em;}
+.ticks li b{color:var(--gold-soft);font-weight:700;}
+
+/* before/after compare strip */
+.compare{display:grid;grid-template-columns:1fr auto 1fr;gap:clamp(0.8rem,2vw,2rem);align-items:stretch;}
+@media (max-width:780px){.compare{grid-template-columns:1fr;}.compare .arrow{transform:rotate(90deg);}}
+.panel{border:1px solid rgba(216,171,91,0.18);border-radius:14px;padding:clamp(0.9rem,2vw,1.5rem);background:rgba(255,255,255,0.02);}
+.panel.bad{border-color:rgba(184,176,163,0.25);}
+.panel.good{border-color:rgba(194,54,47,0.45);box-shadow:0 0 0 1px rgba(194,54,47,0.12) inset;}
+.panel .lbl{font-size:var(--small-size);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:0.6rem;}
+.panel.bad .lbl{color:var(--paper-dim);}
+.panel.good .lbl{color:var(--seal);}
+.panel ul{list-style:none;display:flex;flex-direction:column;gap:0.45rem;}
+.panel li{font-size:var(--small-size);color:var(--paper-dim);line-height:1.4;}
+.panel.good li{color:var(--paper);}
+.arrow{display:grid;place-items:center;color:var(--gold);font-size:clamp(1.4rem,3vw,2.2rem);}
+
+/* tech tags */
+.tags{display:flex;flex-wrap:wrap;gap:clamp(0.5rem,1.2vw,0.9rem);}
+.tag{font-family:var(--font-body);font-size:var(--small-size);color:var(--gold-soft);
+  border:1px solid rgba(216,171,91,0.3);border-radius:999px;padding:0.45em 1.1em;background:rgba(216,171,91,0.05);}
+
+/* scenarios */
+.scene-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(0.6rem,1.5vw,1.1rem);}
+@media (max-width:820px){.scene-grid{grid-template-columns:1fr 1fr;}}
+@media (max-width:520px){.scene-grid{grid-template-columns:1fr;}}
+.scene{border-left:2px solid var(--seal);padding:0.3rem 0 0.3rem 0.9rem;}
+.scene h3{font-family:var(--font-han);font-weight:700;font-size:clamp(0.95rem,1.9vw,1.25rem);color:var(--paper);}
+.scene p{font-size:var(--small-size);}
+
+/* closing */
+.closing .slide-content{align-items:center;text-align:center;gap:var(--content-gap);}
+.closing h2{font-size:clamp(2rem,6vw,4.5rem);}
+
+/* ===========================================
+   REVEAL ANIMATIONS — triggered by .visible (JS)
+   =========================================== */
+.reveal{opacity:0;transform:translateY(34px);
+  transition:opacity var(--dur) var(--ease),transform var(--dur) var(--ease);}
+.slide.visible .reveal{opacity:1;transform:translateY(0);}
+.slide.visible .reveal:nth-child(1){transition-delay:0.08s;}
+.slide.visible .reveal:nth-child(2){transition-delay:0.18s;}
+.slide.visible .reveal:nth-child(3){transition-delay:0.28s;}
+.slide.visible .reveal:nth-child(4){transition-delay:0.38s;}
+.slide.visible .reveal:nth-child(5){transition-delay:0.48s;}
+.slide.visible .reveal:nth-child(6){transition-delay:0.58s;}
+/* stagger grid children */
+.slide.visible .stagger>*{opacity:0;transform:translateY(26px);animation:rise 0.7s var(--ease) forwards;}
+.slide.visible .stagger>*:nth-child(1){animation-delay:0.15s;}
+.slide.visible .stagger>*:nth-child(2){animation-delay:0.25s;}
+.slide.visible .stagger>*:nth-child(3){animation-delay:0.35s;}
+.slide.visible .stagger>*:nth-child(4){animation-delay:0.45s;}
+.slide.visible .stagger>*:nth-child(5){animation-delay:0.55s;}
+.slide.visible .stagger>*:nth-child(6){animation-delay:0.65s;}
+@keyframes rise{to{opacity:1;transform:translateY(0);}}
+
+/* ===========================================
+   CHROME — progress bar, nav dots, slide index, hint
+   =========================================== */
+.progress-bar{position:fixed;top:0;left:0;height:3px;width:0;z-index:50;
+  background:linear-gradient(90deg,var(--seal),var(--gold));transition:width 0.2s ease;}
+.nav-dots{position:fixed;right:clamp(10px,1.4vw,22px);top:50%;transform:translateY(-50%);
+  display:flex;flex-direction:column;gap:11px;z-index:50;}
+.nav-dots button{width:9px;height:9px;border-radius:50%;border:1px solid var(--gold);
+  background:transparent;cursor:pointer;padding:0;transition:all 0.25s ease;}
+.nav-dots button.active{background:var(--seal);border-color:var(--seal);transform:scale(1.35);}
+.slide-index{position:fixed;left:clamp(14px,2vw,34px);bottom:clamp(14px,2vw,30px);z-index:50;
+  font-family:var(--font-display);color:var(--paper-dim);font-size:var(--small-size);letter-spacing:0.2em;}
+.slide-index b{color:var(--gold);}
+.keyboard-hint{position:fixed;right:clamp(14px,2vw,34px);bottom:clamp(14px,2vw,30px);z-index:50;
+  font-size:0.7rem;letter-spacing:0.12em;color:var(--paper-dim);opacity:0.6;}
+</style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+<nav class="nav-dots" id="navDots" aria-label="幻灯片导航"></nav>
+<div class="slide-index"><b id="curIdx">01</b> / <span id="totIdx">12</span></div>
+<div class="keyboard-hint">← → / 空格 翻页</div>
+
+<!-- =================================================================
+     SLIDE 1 — TITLE
+     ================================================================= -->
+<section class="slide title-slide">
+  <div class="slide-content">
+    <div class="brandline">
+      <div class="seal title-seal" aria-hidden="true">
+        <svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="100" cy="100" r="92" fill="none" stroke="#c2362f" stroke-width="9"/>
+          <circle cx="100" cy="100" r="78" fill="none" stroke="#c2362f" stroke-width="2.5"/>
+          <path d="M100 38 l10 22 24 3 -17.5 17 4.5 24 -21 -11.5 -21 11.5 4.5 -24 -17.5 -17 24 -3 z" fill="#c2362f"/>
+          <text x="100" y="138" text-anchor="middle" font-family="'Songti SC','STSong',serif" font-weight="700" font-size="58" fill="#c2362f">印</text>
+        </svg>
+      </div>
+      <h1 class="reveal">CorpSeals<span class="sub">PDF 电子签章工作台</span></h1>
+    </div>
+    <div class="tagline reveal han"><span>安全</span><span>合规</span><span>高效</span></div>
+    <p class="reveal" style="text-align:center;max-width:46ch;">为企业用章而生 —— 多主体印章管理、批量与骑缝盖章、所见即所得导出，全程本地、离线可用。</p>
+  </div>
+  <div class="ghost han" aria-hidden="true">印</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 2 — THE PROBLEM
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <div class="head">
+      <span class="kicker reveal">痛点 · The Problem</span>
+      <h2 class="reveal">纸质用章，<span class="em-red han">慢、错、难追溯</span></h2>
+    </div>
+    <div class="two-col">
+      <ul class="ticks reveal">
+        <li>盖一份多页合同要逐页翻盖，<b>骑缝章</b>对不齐、漏页常发生</li>
+        <li>财务、法人、合同章散落各处，<b>用错章</b>的风险高</li>
+        <li>盖完才发现位置歪了，只能<b>重打重盖</b></li>
+        <li>谁、在什么时候盖了哪份文件，<b>无据可查</b></li>
+      </ul>
+      <div class="reveal" style="text-align:center;">
+        <div class="lead-num">80%</div>
+        <p style="margin:0 auto;text-align:center;">的用章纠纷源于<span class="em-gold han">流程不规范</span>与<span class="em-gold han">记录缺失</span></p>
+      </div>
+    </div>
+  </div>
+  <div class="ghost han" aria-hidden="true">慢</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 3 — WHAT IS IT (positioning)
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <span class="kicker reveal">定位 · What is CorpSeals</span>
+    <h2 class="reveal" style="max-width:18ch;margin-top:0.4rem;">一个<span class="em-red han">桌面级</span>的 PDF 电子签章工作台</h2>
+    <p class="reveal" style="margin-top:1rem;font-size:clamp(0.95rem,2vw,1.4rem);color:var(--paper);max-width:44ch;">
+      把<span class="em-gold han">印章管理</span>、<span class="em-gold han">盖章</span>、<span class="em-gold han">资质处理</span>、<span class="em-gold han">用章留痕</span>
+      收进同一个工作台 —— 上传 PDF，选主体，所见即所得地盖章导出。数据全部存在本地。
+    </p>
+  </div>
+  <div class="ghost han" aria-hidden="true">章</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 4 — FEATURE OVERVIEW (6 cards)
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <div class="head">
+      <span class="kicker reveal">总览 · Capabilities</span>
+      <h2 class="reveal">六大核心能力</h2>
+    </div>
+    <div class="cards stagger">
+      <div class="card-x"><span class="idx">01</span><h3>多主体印章库</h3><p>多家公司分别管理公章 / 合同章 / 财务章 / 法人章。</p></div>
+      <div class="card-x"><span class="idx">02</span><h3>毫米级尺寸</h3><p>按真实物理尺寸（mm）设定印章，导出严丝合缝。</p></div>
+      <div class="card-x"><span class="idx">03</span><h3>三种盖章模式</h3><p>批量、指定页、骑缝章，覆盖全部用章场景。</p></div>
+      <div class="card-x"><span class="idx">04</span><h3>所见即所得</h3><p>预览位置与导出 100% 一致，不再错位重盖。</p></div>
+      <div class="card-x"><span class="idx">05</span><h3>用章记录</h3><p>每次导出自动留痕，可随时重新下载。</p></div>
+      <div class="card-x"><span class="idx">06</span><h3>资质管理</h3><p>营业执照等资料加盖公章与水印后导出。</p></div>
+    </div>
+  </div>
+  <div class="ghost han" aria-hidden="true">能</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 5 — SEAL MANAGEMENT
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <span class="kicker reveal">其一 · 印章管理</span>
+    <h2 class="reveal" style="margin:0.4rem 0 1rem;">把每一枚印章<span class="em-red han">管清楚</span></h2>
+    <ul class="ticks reveal">
+      <li>上传红色扫描件，<b>自动去白底、裁边</b>生成透明 PNG，可直接盖章</li>
+      <li>每个主体独立维护公章、合同章、财务章、法人章四类印章</li>
+      <li>每枚印章<b>按 mm 设定尺寸</b>，预设 42 / 40 / 36 / 22 / 18，也可自定义</li>
+      <li>卡片式列表，缩略图、尺寸、删除/替换一目了然</li>
+    </ul>
+  </div>
+  <div class="ghost han" aria-hidden="true">印</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 6 — THREE STAMPING MODES
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <div class="head">
+      <span class="kicker reveal">其二 · 盖章模式</span>
+      <h2 class="reveal">一套工具，三种盖法</h2>
+    </div>
+    <div class="modes stagger">
+      <div class="mode"><span class="stamp-badge han">批</span><h3>批量盖章</h3><p>指定页码范围，一键给每页盖章；还能对单独某页微调位置。</p></div>
+      <div class="mode"><span class="stamp-badge han">页</span><h3>指定页盖章</h3><p>像 1,3,5-8 这样精确指定页码；切换预览页时目标页自动跟随。</p></div>
+      <div class="mode"><span class="stamp-badge han">缝</span><h3>骑缝章</h3><p>公章纵向拆分跨页，按份数分组循环，覆盖范围内每一页、不漏页。</p></div>
+    </div>
+  </div>
+  <div class="ghost han" aria-hidden="true">盖</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 7 — WYSIWYG (the position-fix highlight)
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <div class="head">
+      <span class="kicker reveal">其三 · 所见即所得</span>
+      <h2 class="reveal">预览在哪，导出就在哪</h2>
+    </div>
+    <div class="compare stagger">
+      <div class="panel bad">
+        <div class="lbl">过去</div>
+        <ul>
+          <li>预览按印章中心定位</li>
+          <li>导出却按左上角落点</li>
+          <li>结果整体偏移半枚章</li>
+          <li>反复重盖、对位耗时</li>
+        </ul>
+      </div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="panel good">
+        <div class="lbl">CorpSeals</div>
+        <ul>
+          <li>预览与导出统一以中心对齐</li>
+          <li>毫米尺寸 + 百分比定位一致</li>
+          <li>缩放 / 全屏 / 适合宽度随心</li>
+          <li>导出文件名自动加 <b>_已电子签章</b></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="ghost han" aria-hidden="true">准</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 8 — RECORDS & QUALIFICATIONS
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <span class="kicker reveal">其四 · 留痕与资质</span>
+    <h2 class="reveal" style="margin:0.4rem 0 1rem;">盖完有据，资料合规</h2>
+    <div class="two-col">
+      <ul class="ticks reveal">
+        <li><b>用章文件记录</b>：每次导出自动留存，主体 / 页数 / 时间一应俱全，可<b>再次下载</b></li>
+        <li><b>主体资质管理</b>：图片 / PDF / Word 统一收纳，列表内即可预览</li>
+        <li>下载时弹窗设置<b>用途、加公章、加水印</b>，叠加后导出</li>
+      </ul>
+      <ul class="ticks reveal">
+        <li>水印为<b>用途 + 时间戳</b>，45° 斜铺、20% 透明、宋体灰字</li>
+        <li>公章自动盖在右下角，资质<b>可追溯、防滥用</b></li>
+        <li>记录最多留存最近 50 条，本地持久化</li>
+      </ul>
+    </div>
+  </div>
+  <div class="ghost han" aria-hidden="true">据</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 9 — SECURITY / LOCAL-FIRST
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <div class="two-col">
+      <div>
+        <span class="kicker reveal">其五 · 数据安全</span>
+        <h2 class="reveal" style="margin:0.4rem 0 1rem;">数据<span class="em-red han">不出本机</span></h2>
+        <ul class="ticks reveal">
+          <li>印章、主体、资质、记录全部存于<b>本地</b></li>
+          <li>桌面版写入应用数据文件，浏览器版用 IndexedDB</li>
+          <li>登录守护，<b>离线可用</b>，无需联网上传</li>
+        </ul>
+      </div>
+      <div class="reveal" style="text-align:center;">
+        <div class="lead-num">100%</div>
+        <p style="margin:0 auto;text-align:center;">本地处理 ·<br><span class="em-gold han">零上传</span> · 离线优先</p>
+      </div>
+    </div>
+  </div>
+  <div class="ghost han" aria-hidden="true">守</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 10 — TECH STACK
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <span class="kicker reveal">工程 · Under the Hood</span>
+    <h2 class="reveal" style="margin:0.4rem 0 1.2rem;">轻、快、可打包</h2>
+    <div class="tags reveal" style="margin-bottom:1.4rem;">
+      <span class="tag">Electron 桌面版</span>
+      <span class="tag">React 18 + TypeScript</span>
+      <span class="tag">pdf-lib · 写章导出</span>
+      <span class="tag">pdf.js · 页面渲染</span>
+      <span class="tag">Canvas · 印章去底</span>
+      <span class="tag">本地存储 · IndexedDB / 文件</span>
+    </div>
+    <p class="reveal" style="font-size:clamp(0.9rem,1.9vw,1.25rem);color:var(--paper);">
+      单仓库前端架构，一条 <span class="em-gold">npm run dist:mac</span> 即可打出 macOS <span class="em-gold">arm64</span> 安装包。
+    </p>
+  </div>
+  <div class="ghost han" aria-hidden="true">技</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 11 — SCENARIOS
+     ================================================================= -->
+<section class="slide">
+  <div class="slide-content">
+    <div class="head">
+      <span class="kicker reveal">场景 · Where it fits</span>
+      <h2 class="reveal">哪里需要盖章，哪里就用得上</h2>
+    </div>
+    <div class="scene-grid stagger">
+      <div class="scene"><h3>合同签署</h3><p>多页合同批量盖章 + 骑缝章，一次成型。</p></div>
+      <div class="scene"><h3>招投标文件</h3><p>标书逐页用章、资质盖章，规范留痕。</p></div>
+      <div class="scene"><h3>资质核验</h3><p>营业执照加水印注明用途，防止被滥用。</p></div>
+      <div class="scene"><h3>财务单据</h3><p>财务章精确定位，批量处理回单凭证。</p></div>
+      <div class="scene"><h3>多主体代办</h3><p>一个工作台管理多家公司的印章。</p></div>
+      <div class="scene"><h3>对外函件</h3><p>公章 + 法人章组合，正式文书快速出具。</p></div>
+    </div>
+  </div>
+  <div class="ghost han" aria-hidden="true">用</div>
+</section>
+
+<!-- =================================================================
+     SLIDE 12 — CLOSING
+     ================================================================= -->
+<section class="slide closing">
+  <div class="slide-content">
+    <div class="seal reveal" aria-hidden="true" style="margin:0 auto;">
+      <svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="100" cy="100" r="92" fill="none" stroke="#c2362f" stroke-width="9"/>
+        <circle cx="100" cy="100" r="78" fill="none" stroke="#c2362f" stroke-width="2.5"/>
+        <path d="M100 38 l10 22 24 3 -17.5 17 4.5 24 -21 -11.5 -21 11.5 4.5 -24 -17.5 -17 24 -3 z" fill="#c2362f"/>
+        <text x="100" y="138" text-anchor="middle" font-family="'Songti SC','STSong',serif" font-weight="700" font-size="58" fill="#c2362f">印</text>
+      </svg>
+    </div>
+    <h2 class="reveal">让用章这件事，<span class="em-red han">规范又省心</span></h2>
+    <p class="reveal" style="text-align:center;max-width:40ch;">CorpSeals —— 安全 · 合规 · 高效的 PDF 电子签章工作台。</p>
+    <div class="tagline reveal han" style="margin-top:0.4rem;"><span>本地优先</span><span>所见即所得</span><span>用章留痕</span></div>
+  </div>
+  <div class="ghost han" aria-hidden="true">成</div>
+</section>
+
+<script>
+/* ===========================================
+   SLIDE PRESENTATION CONTROLLER
+   - IntersectionObserver drives reveal + chrome
+   - Keyboard / wheel / touch navigation
+   - Progress bar, nav dots, slide index
+   =========================================== */
+class SlidePresentation {
+  constructor(){
+    this.slides = [...document.querySelectorAll('.slide')];
+    this.current = 0;
+    this.locked = false;
+    this.progress = document.getElementById('progress');
+    this.curIdx = document.getElementById('curIdx');
+    document.getElementById('totIdx').textContent = String(this.slides.length).padStart(2,'0');
+    this.buildDots();
+    this.observe();
+    this.keys();
+    this.wheel();
+    this.touch();
+  }
+
+  /* nav dots ------------------------------------------------ */
+  buildDots(){
+    const nav = document.getElementById('navDots');
+    this.slides.forEach((_,i)=>{
+      const b=document.createElement('button');
+      b.setAttribute('aria-label','第'+(i+1)+'页');
+      b.addEventListener('click',()=>this.goTo(i));
+      nav.appendChild(b);
+    });
+    this.dots=[...nav.children];
+  }
+
+  /* reveal + active state via observer ---------------------- */
+  observe(){
+    const io=new IntersectionObserver((entries)=>{
+      entries.forEach(e=>{
+        if(e.isIntersecting && e.intersectionRatio>=0.55){
+          e.target.classList.add('visible');
+          this.current=this.slides.indexOf(e.target);
+          this.sync();
+        }
+      });
+    },{threshold:[0.55]});
+    this.slides.forEach(s=>io.observe(s));
+  }
+
+  sync(){
+    const pct=(this.current/(this.slides.length-1))*100;
+    this.progress.style.width=pct+'%';
+    this.curIdx.textContent=String(this.current+1).padStart(2,'0');
+    this.dots.forEach((d,i)=>d.classList.toggle('active',i===this.current));
+  }
+
+  goTo(i){
+    i=Math.max(0,Math.min(this.slides.length-1,i));
+    this.slides[i].scrollIntoView({behavior:'smooth'});
+  }
+  next(){this.goTo(this.current+1);}
+  prev(){this.goTo(this.current-1);}
+
+  /* keyboard ----------------------------------------------- */
+  keys(){
+    window.addEventListener('keydown',(e)=>{
+      if(['ArrowDown','ArrowRight','PageDown',' '].includes(e.key)){e.preventDefault();this.next();}
+      else if(['ArrowUp','ArrowLeft','PageUp'].includes(e.key)){e.preventDefault();this.prev();}
+      else if(e.key==='Home'){e.preventDefault();this.goTo(0);}
+      else if(e.key==='End'){e.preventDefault();this.goTo(this.slides.length-1);}
+    });
+  }
+
+  /* wheel (debounced so one notch = one slide) ------------- */
+  wheel(){
+    window.addEventListener('wheel',(e)=>{
+      if(this.locked) return;
+      if(Math.abs(e.deltaY)<18) return;
+      this.locked=true;
+      if(e.deltaY>0){this.next();}else{this.prev();}
+      setTimeout(()=>{this.locked=false;},700);
+    },{passive:true});
+  }
+
+  /* touch swipe -------------------------------------------- */
+  touch(){
+    let y0=null;
+    window.addEventListener('touchstart',(e)=>{y0=e.touches[0].clientY;},{passive:true});
+    window.addEventListener('touchend',(e)=>{
+      if(y0===null) return;
+      const dy=y0-e.changedTouches[0].clientY;
+      if(Math.abs(dy)>50){dy>0?this.next():this.prev();}
+      y0=null;
+    },{passive:true});
+  }
+}
+
+document.addEventListener('DOMContentLoaded',()=>{
+  const app=new SlidePresentation();
+  app.slides[0].classList.add('visible');
+  app.sync();
+});
+</script>
+</body>
+</html>
