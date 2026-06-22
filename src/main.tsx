@@ -16,10 +16,12 @@ import {
   Settings,
   Plus,
   RotateCcw,
+  Redo2,
   Save,
   Scissors,
   Stamp,
   Trash2,
+  Undo2,
   Upload,
   X,
 } from 'lucide-react';
@@ -187,8 +189,10 @@ const DEFAULT_SEAL_MM: Record<SealKind, number> = {
   legal: 18,
 };
 const SEAL_SIZE_PRESETS = [42, 40, 36, 22, 18];
+const MAX_ACTION_HISTORY = 50;
 
 type SealSizes = Partial<Record<SealKind, number>>;
+type ActionHistoryUpdater = StampAction[] | ((list: StampAction[]) => StampAction[]);
 
 function sealMm(kind: SealKind, sizes?: SealSizes) {
   const value = sizes?.[kind];
@@ -207,6 +211,32 @@ function sealSizePercent(kind: SealKind, _fallbackPercent: number, sizes?: SealS
 function sealSizeText(kind: SealKind, sizes?: SealSizes) {
   const mm = sealMm(kind, sizes);
   return `${mm}mm × ${mm}mm`;
+}
+
+function cloneStampActions(list: StampAction[]) {
+  return list.map((action) => {
+    if (action.type === 'seam') {
+      return { ...action, pages: [...action.pages] };
+    }
+    return {
+      ...action,
+      pages: [...action.pages],
+      pageOverrides: action.pageOverrides
+        ? Object.fromEntries(
+          Object.entries(action.pageOverrides).map(([page, position]) => [page, { ...position }]),
+        )
+        : undefined,
+    };
+  });
+}
+
+function sameActionSnapshots(left: StampAction[], right: StampAction[]) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isEditableShortcutTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement
+    && Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
 }
 
 function defaultSeamSplitCount(totalPages: number) {
@@ -1186,6 +1216,8 @@ function App() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [mode, setMode] = useState<StampMode>('batch');
   const [actions, setActions] = useState<StampAction[]>([]);
+  const [undoStack, setUndoStack] = useState<StampAction[][]>([]);
+  const [redoStack, setRedoStack] = useState<StampAction[][]>([]);
   const [editingActionId, setEditingActionId] = useState<string | null>(null);
   const [exportName, setExportName] = useState('已盖章文件_已电子签章.pdf');
   const [records, setRecords] = useState<ExportRecord[]>([]);
@@ -1222,6 +1254,7 @@ function App() {
   const documentStageRef = useRef<HTMLElement | null>(null);
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
   const confirmResolverRef = useRef<((confirmed: boolean) => void) | null>(null);
+  const actionsRef = useRef<StampAction[]>([]);
 
   const activeSubject = useMemo(
     () => subjects.find((subject) => subject.id === activeSubjectId) || subjects[0],
@@ -1235,6 +1268,65 @@ function App() {
     setRememberLogin(true);
     setIsAuthenticated(true);
   }, []);
+
+  useEffect(() => {
+    actionsRef.current = actions;
+  }, [actions]);
+
+  function replaceActions(nextActions: StampAction[]) {
+    const cloned = cloneStampActions(nextActions);
+    actionsRef.current = cloned;
+    setActions(cloned);
+  }
+
+  function resetActionHistory(nextActions: StampAction[] = []) {
+    replaceActions(nextActions);
+    setUndoStack([]);
+    setRedoStack([]);
+  }
+
+  function commitActions(updater: ActionHistoryUpdater) {
+    const current = cloneStampActions(actionsRef.current);
+    const nextValue = typeof updater === 'function' ? updater(cloneStampActions(current)) : updater;
+    const normalized = dedupeSeamActions(cloneStampActions(nextValue));
+    if (sameActionSnapshots(current, normalized)) return false;
+    setUndoStack((stack) => [...stack.slice(-(MAX_ACTION_HISTORY - 1)), current]);
+    setRedoStack([]);
+    replaceActions(normalized);
+    return true;
+  }
+
+  function clearInvalidEditingAction(nextActions: StampAction[]) {
+    setEditingActionId((id) => (id && !nextActions.some((action) => action.id === id) ? null : id));
+  }
+
+  function undoActions() {
+    if (!undoStack.length) {
+      setStatus('没有可撤销的盖章操作。');
+      return;
+    }
+    const previous = cloneStampActions(undoStack[undoStack.length - 1]);
+    const current = cloneStampActions(actionsRef.current);
+    setUndoStack((stack) => stack.slice(0, -1));
+    setRedoStack((stack) => [...stack.slice(-(MAX_ACTION_HISTORY - 1)), current]);
+    replaceActions(previous);
+    clearInvalidEditingAction(previous);
+    setStatus('已撤销上一步盖章操作。');
+  }
+
+  function redoActions() {
+    if (!redoStack.length) {
+      setStatus('没有可恢复的盖章操作。');
+      return;
+    }
+    const next = cloneStampActions(redoStack[redoStack.length - 1]);
+    const current = cloneStampActions(actionsRef.current);
+    setRedoStack((stack) => stack.slice(0, -1));
+    setUndoStack((stack) => [...stack.slice(-(MAX_ACTION_HISTORY - 1)), current]);
+    replaceActions(next);
+    clearInvalidEditingAction(next);
+    setStatus('已恢复下一步盖章操作。');
+  }
 
   function resolveConfirmDialog(confirmed: boolean) {
     confirmResolverRef.current?.(confirmed);
@@ -1267,7 +1359,7 @@ function App() {
         if (isCancelled) return;
         setSubjects(nextSubjects);
         setActiveSubjectId(nextActiveId);
-        setActions(persisted?.actions || []);
+        resetActionHistory(persisted?.actions || []);
         setRecords(persisted?.records || []);
         setExportName(persisted?.exportName || '已盖章文件_已电子签章.pdf');
         setStorageInfo(nextStorageInfo);
@@ -1283,7 +1375,7 @@ function App() {
         const legacySubjects = readLegacySubjects();
         setSubjects(legacySubjects);
         setActiveSubjectId(legacySubjects[0]?.id || '');
-        setActions([]);
+        resetActionHistory();
         setStorageInfo(null);
         setEditingActionId(null);
         setIsDatabaseReady(true);
@@ -1334,10 +1426,9 @@ function App() {
   }, [overridePage, pagePositionOverrides, xPercent, yPercent]);
 
   useEffect(() => {
-    setActions((list) => {
-      const normalized = dedupeSeamActions(list);
-      return normalized.length === list.length ? list : normalized;
-    });
+    const normalized = dedupeSeamActions(actions);
+    if (normalized.length === actions.length) return;
+    replaceActions(normalized);
   }, [actions]);
 
   // 指定页模式下，切换预览页时让目标页码跟随当前页（编辑已有操作时除外）。
@@ -1346,10 +1437,29 @@ function App() {
     setSpecificPages((current) => (current === String(currentPage) ? current : String(currentPage)));
   }, [mode, currentPage, editingActionId, pageCount]);
 
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      const key = event.key.toLowerCase();
+      const isUndo = (event.ctrlKey || event.metaKey) && key === 'z' && !event.shiftKey;
+      const isRedo = (event.ctrlKey || event.metaKey) && (key === 'y' || (key === 'z' && event.shiftKey));
+      if (!isUndo && !isRedo) return;
+      if (isEditableShortcutTarget(event.target) || confirmDialog || previewQualification || downloadConfig) return;
+      event.preventDefault();
+      if (isUndo) undoActions();
+      if (isRedo) redoActions();
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isAuthenticated, confirmDialog, previewQualification, downloadConfig, undoStack, redoStack]);
+
   const currentActions = useMemo(
     () => actions.filter((action) => action.pages.includes(currentPage)),
     [actions, currentPage],
   );
+  const canUndoActions = undoStack.length > 0;
+  const canRedoActions = redoStack.length > 0;
 
   const currentSealSizePercent = sealSizePercent(selectedSealKind, sizePercent, activeSubject?.sealSizes);
   const draftSealSrc = mode !== 'seam' ? activeSubject?.seals[selectedSealKind] : undefined;
@@ -1389,7 +1499,7 @@ function App() {
     setPdfDocument(loaded);
     setPageCount(loaded.numPages);
     setCurrentPage(1);
-    setActions([]);
+    resetActionHistory();
     setEditingActionId(null);
     setPagePositionOverrides({});
     setOverridePage(1);
@@ -1415,7 +1525,7 @@ function App() {
     setPdfDocument(null);
     setPageCount(0);
     setCurrentPage(1);
-    setActions([]);
+    resetActionHistory();
     setEditingActionId(null);
     setPagePositionOverrides({});
     setRenderPage({ width: 1, height: 1, scale: 1 });
@@ -1598,7 +1708,7 @@ function App() {
     setSubjects(nextSubjects);
     if (activeSubject?.id === subjectId) {
       setActiveSubjectId(nextSubjects[0]?.id || '');
-      setActions([]);
+      resetActionHistory();
       setEditingActionId(null);
     }
     setStatus(`已删除主体：${target.name}`);
@@ -1613,7 +1723,7 @@ function App() {
       tone: 'danger',
     });
     if (!confirmed) return;
-    setActions([]);
+    commitActions([]);
     setEditingActionId(null);
     setStatus('已清空盖章记录。');
   }
@@ -1629,7 +1739,7 @@ function App() {
     if (!confirmed) return;
     setSubjects([]);
     setActiveSubjectId('');
-    setActions([]);
+    resetActionHistory();
     setEditingActionId(null);
     setStatus('已删除全部主体。');
   }
@@ -1794,7 +1904,7 @@ function App() {
       const id = editingActionId || uid('stamp');
       const nextOverrides = normalizePageOverrides(pages, pagePositionOverrides, xPercent, yPercent);
       const nextAction: StampAction = { id, type: 'normal', pages, sealKind: selectedSealKind, xPercent, yPercent, sizePercent: currentSealSizePercent, pageOverrides: nextOverrides };
-      setActions((list) => (editingActionId
+      commitActions((list) => (editingActionId
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
         : [...list, nextAction]));
       setEditingActionId(null);
@@ -1808,7 +1918,7 @@ function App() {
       }
       const id = editingActionId || uid('stamp');
       const nextAction: StampAction = { id, type: 'normal', pages, sealKind: selectedSealKind, xPercent, yPercent, sizePercent: currentSealSizePercent };
-      setActions((list) => (editingActionId
+      commitActions((list) => (editingActionId
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
         : [...list, nextAction]));
       setEditingActionId(null);
@@ -1824,7 +1934,7 @@ function App() {
       const existingSameRange = actions.find((action) => action.type === 'seam' && samePages(action.pages, pages));
       const id = editingActionId || existingSameRange?.id || uid('seam');
       const nextAction: StampAction = { id, type: 'seam', pages, splitCount: nextSplitCount, yPercent: seamY, heightPercent: sealSizePercent('official', seamHeight, activeSubject?.sealSizes), rightInsetPercent: seamInset };
-      setActions((list) => (editingActionId
+      commitActions((list) => (editingActionId
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
         : existingSameRange
           ? [...list.filter((action) => !(action.type === 'seam' && samePages(action.pages, pages))), nextAction]
@@ -2526,6 +2636,13 @@ function App() {
                 />
                 <span>/ {pageCount || 0}</span>
               </div>
+              <span className="toolbar-divider" />
+              <button className="icon-button" title="撤销 Ctrl+Z" disabled={!canUndoActions} onClick={undoActions}>
+                <Undo2 size={16} />
+              </button>
+              <button className="icon-button" title="恢复 Ctrl+Y" disabled={!canRedoActions} onClick={redoActions}>
+                <Redo2 size={16} />
+              </button>
               <div className="document-title-chip" title={pdfName || '未选择 PDF'}>
                 <FileText size={15} />
                 <span>{pdfName || '未选择 PDF'}</span>
@@ -2869,7 +2986,7 @@ function App() {
                   className="op-del"
                   onClick={(event) => {
                     event.stopPropagation();
-                    setActions((list) => list.filter((item) => item.id !== action.id));
+                    commitActions((list) => list.filter((item) => item.id !== action.id));
                     if (editingActionId === action.id) setEditingActionId(null);
                   }}
                   title="删除"
