@@ -35,8 +35,8 @@ pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 function BrandLogo({ size = 34 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 64 64" role="img" aria-label="CorpSeals" xmlns="http://www.w3.org/2000/svg">
-      <rect x="2" y="2" width="60" height="60" rx="15" fill="#b42335" />
-      <rect x="2" y="2" width="60" height="60" rx="15" fill="none" stroke="#8f1d2c" strokeWidth="2" />
+      <rect x="2" y="2" width="60" height="60" rx="15" fill="var(--seal)" />
+      <rect x="2" y="2" width="60" height="60" rx="15" fill="none" stroke="var(--seal-dark)" strokeWidth="2" />
       <text
         x="32"
         y="33"
@@ -56,6 +56,12 @@ function BrandLogo({ size = 34 }: { size?: number }) {
 type SealKind = 'official' | 'contract' | 'financial' | 'legal';
 type StampMode = 'batch' | 'specific' | 'seam';
 type SideView = 'subjects' | 'records' | 'settings' | 'qualifications';
+type ColorTheme = 'red' | 'green' | 'purple';
+
+type LoginCredentials = {
+  username: string;
+  password: string;
+};
 
 type Subject = {
   id: string;
@@ -76,6 +82,42 @@ type Qualification = {
   addSeal: boolean;
   addWatermark: boolean;
   sealPosition?: SealPosition;
+};
+
+type MaterialSealEntry = {
+  kind: SealKind;
+  file: string;
+  mimeType: string;
+  sizeMm?: number;
+};
+
+type MaterialQualificationEntry = {
+  file: string;
+  name: string;
+  mimeType: string;
+  purpose: string;
+  addSeal: boolean;
+  addWatermark: boolean;
+  sealPosition?: SealPosition;
+};
+
+type MaterialSubjectEntry = {
+  name: string;
+  sealSizes?: Partial<Record<SealKind, number>>;
+  seals: MaterialSealEntry[];
+  qualifications: MaterialQualificationEntry[];
+};
+
+type MaterialPackageManifest = {
+  app: 'CorpSeals';
+  version: 1;
+  exportedAt: string;
+  subjects: MaterialSubjectEntry[];
+};
+
+type ZipFileEntry = {
+  path: string;
+  data: Uint8Array;
 };
 
 const SEAL_POSITION_LABELS: Record<SealPosition, string> = {
@@ -122,12 +164,19 @@ type RenderPage = {
 
 type ExportRecord = {
   id: string;
+  kind?: 'export' | 'workflow';
   name: string;
   subjectName: string;
   pageCount: number;
   actionCount: number;
   createdAt: string;
-  dataUrl: string;
+  dataUrl?: string;
+  sourcePdfName?: string;
+  sourcePdfDataUrl?: string;
+  activeSubjectId?: string;
+  actions?: StampAction[];
+  exportName?: string;
+  currentPage?: number;
 };
 
 type PersistedAppData = {
@@ -136,6 +185,8 @@ type PersistedAppData = {
   actions: StampAction[];
   exportName: string;
   records?: ExportRecord[];
+  colorTheme?: ColorTheme;
+  loginCredentials?: LoginCredentials;
 };
 
 type StorageInfo = {
@@ -163,8 +214,10 @@ declare global {
   }
 }
 
-const LOGIN_USERNAME = 'joozo';
-const LOGIN_PASSWORD = '7777';
+const DEFAULT_LOGIN_CREDENTIALS: LoginCredentials = {
+  username: 'joozo',
+  password: '7777',
+};
 const REMEMBER_LOGIN_KEY = 'corp-seals.remember-login';
 const REMEMBER_LOGIN_DAYS = 7;
 const STORAGE_KEY = 'pdf-seal-studio.subjects';
@@ -179,6 +232,12 @@ const sealLabels: Record<SealKind, string> = {
   legal: '法人章',
 };
 const sealKindList = Object.keys(sealLabels) as SealKind[];
+const colorThemeLabels: Record<ColorTheme, string> = {
+  red: '红色',
+  green: '深绿',
+  purple: '紫色',
+};
+const colorThemeList = Object.keys(colorThemeLabels) as ColorTheme[];
 const A4_WIDTH_MM = 210;
 const MIN_SEAL_MM = 5;
 const MAX_SEAL_MM = 80;
@@ -279,6 +338,13 @@ function openAppDatabase() {
 
 function normalizePersistedAppData(value: PersistedAppData | null | undefined): PersistedAppData | null {
   if (!value || typeof value !== 'object') return null;
+  const colorTheme = colorThemeList.includes(value.colorTheme as ColorTheme)
+    ? value.colorTheme
+    : 'red';
+  const savedCredentials = value.loginCredentials;
+  const loginCredentials = savedCredentials?.username?.trim() && savedCredentials.password
+    ? { username: savedCredentials.username.trim(), password: savedCredentials.password }
+    : DEFAULT_LOGIN_CREDENTIALS;
   return {
     subjects: Array.isArray(value.subjects)
       ? value.subjects.map((subject) => ({ ...subject, qualifications: subject.qualifications || [] }))
@@ -287,6 +353,8 @@ function normalizePersistedAppData(value: PersistedAppData | null | undefined): 
     actions: Array.isArray(value.actions) ? value.actions : [],
     exportName: value.exportName || '已盖章文件_已电子签章.pdf',
     records: Array.isArray(value.records) ? value.records : [],
+    colorTheme,
+    loginCredentials,
   };
 }
 
@@ -348,10 +416,10 @@ function rememberLoginUntil() {
   return Date.now() + REMEMBER_LOGIN_DAYS * 24 * 60 * 60 * 1000;
 }
 
-function readRememberedLogin() {
+function readRememberedLogin(credentials: LoginCredentials) {
   try {
     const parsed = JSON.parse(localStorage.getItem(REMEMBER_LOGIN_KEY) || 'null') as { username?: string; expiresAt?: number } | null;
-    if (!parsed || parsed.username !== LOGIN_USERNAME || !parsed.expiresAt || parsed.expiresAt <= Date.now()) {
+    if (!parsed || parsed.username !== credentials.username || !parsed.expiresAt || parsed.expiresAt <= Date.now()) {
       localStorage.removeItem(REMEMBER_LOGIN_KEY);
       return null;
     }
@@ -362,9 +430,9 @@ function readRememberedLogin() {
   }
 }
 
-function writeRememberedLogin() {
+function writeRememberedLogin(username: string) {
   localStorage.setItem(REMEMBER_LOGIN_KEY, JSON.stringify({
-    username: LOGIN_USERNAME,
+    username,
     expiresAt: rememberLoginUntil(),
   }));
 }
@@ -400,6 +468,15 @@ function fileToDataUrl(file: File) {
     reader.onload = () => resolve(String(reader.result));
     reader.onerror = reject;
     reader.readAsDataURL(file);
+  });
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
   });
 }
 
@@ -675,6 +752,169 @@ function dataUrlToBytes(dataUrl: string) {
   return bytes;
 }
 
+function dataUrlMime(dataUrl: string) {
+  return dataUrl.match(/^data:([^;,]+)/)?.[1] || 'application/octet-stream';
+}
+
+function bytesToDataUrl(bytes: Uint8Array, mimeType: string) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+  }
+  return `data:${mimeType || 'application/octet-stream'};base64,${btoa(binary)}`;
+}
+
+function fileExtensionFromMime(mimeType: string) {
+  if (mimeType === 'image/png') return 'png';
+  if (mimeType === 'image/jpeg') return 'jpg';
+  if (mimeType === 'image/webp') return 'webp';
+  if (mimeType === 'application/pdf') return 'pdf';
+  return 'bin';
+}
+
+function sanitizeFileSegment(value: string, fallback: string) {
+  const cleaned = value
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || fallback;
+}
+
+function uniquePath(path: string, used: Set<string>) {
+  if (!used.has(path)) {
+    used.add(path);
+    return path;
+  }
+  const dotIndex = path.lastIndexOf('.');
+  const base = dotIndex > -1 ? path.slice(0, dotIndex) : path;
+  const extension = dotIndex > -1 ? path.slice(dotIndex) : '';
+  let index = 2;
+  let next = `${base}-${index}${extension}`;
+  while (used.has(next)) {
+    index += 1;
+    next = `${base}-${index}${extension}`;
+  }
+  used.add(next);
+  return next;
+}
+
+function makeCrc32Table() {
+  return Array.from({ length: 256 }, (_, index) => {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    return value >>> 0;
+  });
+}
+
+const CRC32_TABLE = makeCrc32Table();
+
+function crc32(bytes: Uint8Array) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function concatBytes(chunks: Uint8Array[]) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  chunks.forEach((chunk) => {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  });
+  return result;
+}
+
+function createZip(files: ZipFileEntry[]) {
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  const centralDirectory: Uint8Array[] = [];
+  let offset = 0;
+
+  files.forEach((file) => {
+    const nameBytes = encoder.encode(file.path);
+    const crc = crc32(file.data);
+    const localHeader = new Uint8Array(30);
+    const localView = new DataView(localHeader.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0x0800, true);
+    localView.setUint16(8, 0, true);
+    localView.setUint32(14, crc, true);
+    localView.setUint32(18, file.data.length, true);
+    localView.setUint32(22, file.data.length, true);
+    localView.setUint16(26, nameBytes.length, true);
+    chunks.push(localHeader, nameBytes, file.data);
+
+    const centralHeader = new Uint8Array(46);
+    const centralView = new DataView(centralHeader.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0x0800, true);
+    centralView.setUint16(10, 0, true);
+    centralView.setUint32(16, crc, true);
+    centralView.setUint32(20, file.data.length, true);
+    centralView.setUint32(24, file.data.length, true);
+    centralView.setUint16(28, nameBytes.length, true);
+    centralView.setUint32(42, offset, true);
+    centralDirectory.push(centralHeader, nameBytes);
+    offset += localHeader.length + nameBytes.length + file.data.length;
+  });
+
+  const centralOffset = offset;
+  const centralBytes = concatBytes(centralDirectory);
+  chunks.push(centralBytes);
+  const endHeader = new Uint8Array(22);
+  const endView = new DataView(endHeader.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(8, files.length, true);
+  endView.setUint16(10, files.length, true);
+  endView.setUint32(12, centralBytes.length, true);
+  endView.setUint32(16, centralOffset, true);
+  chunks.push(endHeader);
+  return concatBytes(chunks);
+}
+
+function parseZip(bytes: Uint8Array) {
+  const decoder = new TextDecoder();
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let endOffset = -1;
+  for (let offset = bytes.length - 22; offset >= 0; offset -= 1) {
+    if (view.getUint32(offset, true) === 0x06054b50) {
+      endOffset = offset;
+      break;
+    }
+  }
+  if (endOffset < 0) throw new Error('无法识别资料包，请选择本工具导出的 ZIP。');
+  const entryCount = view.getUint16(endOffset + 10, true);
+  let centralOffset = view.getUint32(endOffset + 16, true);
+  const entries = new Map<string, Uint8Array>();
+
+  for (let index = 0; index < entryCount; index += 1) {
+    if (view.getUint32(centralOffset, true) !== 0x02014b50) throw new Error('资料包目录损坏。');
+    const method = view.getUint16(centralOffset + 10, true);
+    if (method !== 0) throw new Error('暂不支持压缩格式，请使用本工具导出的资料包。');
+    const compressedSize = view.getUint32(centralOffset + 20, true);
+    const nameLength = view.getUint16(centralOffset + 28, true);
+    const extraLength = view.getUint16(centralOffset + 30, true);
+    const commentLength = view.getUint16(centralOffset + 32, true);
+    const localOffset = view.getUint32(centralOffset + 42, true);
+    const name = decoder.decode(bytes.slice(centralOffset + 46, centralOffset + 46 + nameLength));
+    const localNameLength = view.getUint16(localOffset + 26, true);
+    const localExtraLength = view.getUint16(localOffset + 28, true);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    entries.set(name, bytes.slice(dataStart, dataStart + compressedSize));
+    centralOffset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
 function parsePageList(input: string, pageCount: number) {
   const pages = new Set<number>();
   input
@@ -849,6 +1089,16 @@ function PageCanvas({
   onRendered: (page: RenderPage) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [fitVersion, setFitVersion] = useState(0);
+
+  useEffect(() => {
+    if (!fitWidth) return;
+    function handleResize() {
+      setFitVersion((version) => version + 1);
+    }
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [fitWidth]);
 
   useEffect(() => {
     let cancelled = false;
@@ -856,7 +1106,20 @@ function PageCanvas({
       if (!pdfDocument || !canvasRef.current) return;
       const page = await pdfDocument.getPage(pageNumber);
       const baseViewport = page.getViewport({ scale: 1 });
-      const fitScale = Math.min(2, Math.max(0.2, (Math.min(900, Math.max(420, window.innerWidth - 700))) / baseViewport.width));
+      const stage = document.querySelector<HTMLElement>('.document-stage');
+      const stageStyle = stage ? window.getComputedStyle(stage) : null;
+      const horizontalPadding = stageStyle
+        ? Number.parseFloat(stageStyle.paddingLeft) + Number.parseFloat(stageStyle.paddingRight)
+        : 60;
+      const verticalPadding = stageStyle
+        ? Number.parseFloat(stageStyle.paddingTop) + Number.parseFloat(stageStyle.paddingBottom)
+        : 60;
+      const availableWidth = Math.max(240, (stage?.clientWidth || window.innerWidth) - horizontalPadding);
+      const availableHeight = Math.max(240, (stage?.clientHeight || window.innerHeight) - verticalPadding);
+      const fitScale = Math.min(
+        4,
+        Math.max(0.2, Math.min(availableWidth / baseViewport.width, availableHeight / baseViewport.height)),
+      );
       const scale = fitWidth ? fitScale : Math.min(4, Math.max(0.2, zoom));
       const viewport = page.getViewport({ scale });
       const canvas = canvasRef.current;
@@ -871,7 +1134,7 @@ function PageCanvas({
     return () => {
       cancelled = true;
     };
-  }, [pdfDocument, pageNumber, zoom, fitWidth, onRendered]);
+  }, [pdfDocument, pageNumber, zoom, fitWidth, fitVersion, onRendered]);
 
   return <canvas className="pdf-canvas" ref={canvasRef} />;
 }
@@ -1201,6 +1464,9 @@ function App() {
   const [loginPassword, setLoginPassword] = useState('');
   const [loginError, setLoginError] = useState('');
   const [rememberLogin, setRememberLogin] = useState(false);
+  const [loginCredentials, setLoginCredentials] = useState<LoginCredentials>(DEFAULT_LOGIN_CREDENTIALS);
+  const [loginUsernameDraft, setLoginUsernameDraft] = useState(DEFAULT_LOGIN_CREDENTIALS.username);
+  const [loginPasswordDraft, setLoginPasswordDraft] = useState(DEFAULT_LOGIN_CREDENTIALS.password);
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [sideView, setSideView] = useState<SideView>('subjects');
   const [activeSubjectId, setActiveSubjectId] = useState('');
@@ -1221,6 +1487,7 @@ function App() {
   const [editingActionId, setEditingActionId] = useState<string | null>(null);
   const [exportName, setExportName] = useState('已盖章文件_已电子签章.pdf');
   const [records, setRecords] = useState<ExportRecord[]>([]);
+  const [colorTheme, setColorTheme] = useState<ColorTheme>('red');
   const [previewQualification, setPreviewQualification] = useState<Qualification | null>(null);
   const [downloadConfig, setDownloadConfig] = useState<{ id: string; name: string; purpose: string; addSeal: boolean; addWatermark: boolean; sealPosition: SealPosition } | null>(null);
   const [isPositioningStamp, setIsPositioningStamp] = useState(false);
@@ -1251,10 +1518,13 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const qualificationInputRef = useRef<HTMLInputElement | null>(null);
   const sealDropInputRef = useRef<HTMLInputElement | null>(null);
+  const materialImportInputRef = useRef<HTMLInputElement | null>(null);
   const documentStageRef = useRef<HTMLElement | null>(null);
+  const pageWrapRef = useRef<HTMLDivElement | null>(null);
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
   const confirmResolverRef = useRef<((confirmed: boolean) => void) | null>(null);
   const actionsRef = useRef<StampAction[]>([]);
+  const lastWheelPageTurnRef = useRef(0);
 
   const activeSubject = useMemo(
     () => subjects.find((subject) => subject.id === activeSubjectId) || subjects[0],
@@ -1362,6 +1632,7 @@ function App() {
         resetActionHistory(persisted?.actions || []);
         setRecords(persisted?.records || []);
         setExportName(persisted?.exportName || '已盖章文件_已电子签章.pdf');
+        setColorTheme(persisted?.colorTheme || 'red');
         setStorageInfo(nextStorageInfo);
         setEditingActionId(null);
         setIsDatabaseReady(true);
@@ -1376,6 +1647,7 @@ function App() {
         setSubjects(legacySubjects);
         setActiveSubjectId(legacySubjects[0]?.id || '');
         resetActionHistory();
+        setColorTheme('red');
         setStorageInfo(null);
         setEditingActionId(null);
         setIsDatabaseReady(true);
@@ -1390,15 +1662,19 @@ function App() {
   }, [isAuthenticated]);
 
   useEffect(() => {
+    document.documentElement.dataset.theme = colorTheme;
+  }, [colorTheme]);
+
+  useEffect(() => {
     if (!isAuthenticated || !isDatabaseReady) return;
     if (!activeSubjectId && subjects[0]) {
       setActiveSubjectId(subjects[0].id);
       return;
     }
-    writePersistedAppData({ subjects, activeSubjectId, actions, exportName, records }).catch(() => {
+    writePersistedAppData({ subjects, activeSubjectId, actions, exportName, records, colorTheme }).catch(() => {
       setStatus('应用数据写入失败，部分大文件可能仅在本次页面会话中可用。');
     });
-  }, [isAuthenticated, isDatabaseReady, subjects, activeSubjectId, actions, exportName, records]);
+  }, [isAuthenticated, isDatabaseReady, subjects, activeSubjectId, actions, exportName, records, colorTheme]);
 
   useEffect(() => {
     setBatchEnd(pageCount || 1);
@@ -1460,6 +1736,12 @@ function App() {
   );
   const canUndoActions = undoStack.length > 0;
   const canRedoActions = redoStack.length > 0;
+  const isEditingBatchAction = Boolean(editingActionId && mode === 'batch');
+  const batchDraftPages = useMemo(
+    () => (mode === 'batch' ? rangePages(batchStart, batchEnd, pageCount) : []),
+    [mode, batchStart, batchEnd, pageCount],
+  );
+  const isCurrentPageInBatchDraft = mode !== 'batch' || batchDraftPages.includes(currentPage);
 
   const currentSealSizePercent = sealSizePercent(selectedSealKind, sizePercent, activeSubject?.sealSizes);
   const draftSealSrc = mode !== 'seam' ? activeSubject?.seals[selectedSealKind] : undefined;
@@ -1479,7 +1761,7 @@ function App() {
   const shouldShowDraftSeam = mode === 'seam' && Boolean(activeSubject?.seals.official) && draftSeamPageIndex >= 0;
   const draftSeamHeight = (renderPage.width * sealSizePercent('official', seamHeight, activeSubject?.sealSizes)) / 100;
   const draftSeamWidth = Math.max(12, draftSeamHeight / Math.max(1, draftSeamSlice?.groupSize || splitCount));
-  const canPositionOnPage = mode === 'seam' ? shouldShowDraftSeam : Boolean(draftSealSrc);
+  const canPositionOnPage = mode === 'seam' ? shouldShowDraftSeam : Boolean(draftSealSrc && isCurrentPageInBatchDraft);
   const isDraftDuplicate = mode !== 'seam' && currentActions.some((action) => (
     (() => {
       if (action.type !== 'normal' || action.id === editingActionId || action.sealKind !== selectedSealKind) return false;
@@ -1489,26 +1771,45 @@ function App() {
         && Math.abs(sealSizePercent(action.sealKind, action.sizePercent, activeSubject?.sealSizes) - currentSealSizePercent) < 0.01;
     })()
   ));
-  const shouldShowDraftStamp = Boolean(draftSealSrc && !isDraftDuplicate);
+  const shouldShowDraftStamp = Boolean(draftSealSrc && isCurrentPageInBatchDraft && !isDraftDuplicate);
 
-  async function openPdf(file: File) {
-    const bytes = new Uint8Array(await file.arrayBuffer());
+  useEffect(() => {
+    if (!isEditingBatchAction || !pageCount) return;
+    if (!batchDraftPages.includes(currentPage)) return;
+    setOverridePage(currentPage);
+    setPositionTarget('page');
+  }, [isEditingBatchAction, currentPage, pageCount, batchDraftPages]);
+
+  async function loadPdfWorkspace(options: {
+    bytes: Uint8Array;
+    name: string;
+    actions?: StampAction[];
+    exportName?: string;
+    currentPage?: number;
+    resetProgress?: boolean;
+  }) {
+    const bytes = options.bytes;
     const loaded = await pdfjs.getDocument({ data: bytes.slice() }).promise;
     setPdfBytes(bytes);
-    setPdfName(file.name);
+    setPdfName(options.name);
     setPdfDocument(loaded);
     setPageCount(loaded.numPages);
-    setCurrentPage(1);
-    resetActionHistory();
+    setCurrentPage(clampPercent(options.currentPage || 1, 1, loaded.numPages));
+    resetActionHistory(options.actions || []);
     setEditingActionId(null);
     setPagePositionOverrides({});
     setOverridePage(1);
     setOverrideDraftTouched(false);
     setPositionTarget('default');
-    setExportName(defaultExportName(file.name));
+    setExportName(options.exportName || defaultExportName(options.name));
     setFitWidth(true);
     setZoom(1);
-    setStatus(`已载入 ${file.name}，共 ${loaded.numPages} 页。`);
+    setStatus(`${options.resetProgress ? '已载入' : '已恢复'} ${options.name}，共 ${loaded.numPages} 页。`);
+  }
+
+  async function openPdf(file: File) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await loadPdfWorkspace({ bytes, name: file.name, resetProgress: true });
   }
 
   async function clearPdf() {
@@ -1530,6 +1831,48 @@ function App() {
     setPagePositionOverrides({});
     setRenderPage({ width: 1, height: 1, scale: 1 });
     setStatus('已移除当前 PDF，可重新上传。');
+  }
+
+  async function closeCurrentWorkflow() {
+    if (!pdfBytes || !pdfDocument || !activeSubject) {
+      setStatus('当前没有可关闭保存的 PDF 流程。');
+      return;
+    }
+    const confirmed = await requestConfirm({
+      title: '关闭并保存流程',
+      message: `关闭“${pdfName}”并保存当前用章进度？之后可在“记录”中继续此文件的用章流程。`,
+      confirmText: '关闭并保存',
+    });
+    if (!confirmed) return;
+    const sourcePdfDataUrl = await blobToDataUrl(new Blob([pdfBytes.slice()], { type: 'application/pdf' }));
+    const workflowActions = actionsWithPendingEdit();
+    const workflowRecord: ExportRecord = {
+      id: uid('workflow'),
+      kind: 'workflow',
+      name: `${pdfName || '未命名文件'} · 用章流程`,
+      subjectName: activeSubject.name,
+      pageCount,
+      actionCount: workflowActions.length,
+      createdAt: timestampText(),
+      sourcePdfName: pdfName,
+      sourcePdfDataUrl,
+      activeSubjectId: activeSubject.id,
+      actions: workflowActions,
+      exportName,
+      currentPage,
+    };
+    setRecords((list) => [workflowRecord, ...list].slice(0, 50));
+    setPdfBytes(null);
+    setPdfName('');
+    setPdfDocument(null);
+    setPageCount(0);
+    setCurrentPage(1);
+    resetActionHistory();
+    setEditingActionId(null);
+    setPagePositionOverrides({});
+    setRenderPage({ width: 1, height: 1, scale: 1 });
+    setSideView('records');
+    setStatus(`已关闭并保存用章流程：${pdfName}`);
   }
 
   function updateSubjectSeal(subjectId: string, kind: SealKind, dataUrl: string) {
@@ -1813,10 +2156,23 @@ function App() {
   }
 
   function updateSeamPositionFromPointer(event: React.PointerEvent<HTMLDivElement>) {
+    updateSeamPositionFromClientPoint(event.clientX, event.clientY);
+  }
+
+  function normalPositionFromClientPoint(clientX: number, clientY: number) {
+    const rect = pageWrapRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const x = ((clientX - rect.left) / rect.width) * 100;
+    const y = ((clientY - rect.top) / rect.height) * 100;
+    return { xPercent: clampPercent(x), yPercent: clampPercent(y) };
+  }
+
+  function updateSeamPositionFromClientPoint(clientX: number, clientY: number) {
     if (mode !== 'seam' || !activeSubject?.seals.official || draftSeamPageIndex < 0) return;
-    const rect = event.currentTarget.getBoundingClientRect();
-    const pointerX = event.clientX - rect.left;
-    const pointerY = event.clientY - rect.top;
+    const rect = pageWrapRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const pointerX = clientX - rect.left;
+    const pointerY = clientY - rect.top;
     const previewHeight = (rect.width * sealSizePercent('official', seamHeight, activeSubject?.sealSizes)) / 100;
     const previewWidth = Math.max(12, previewHeight / Math.max(1, splitCount));
     const maxY = Math.max(0, 100 - (previewHeight / rect.height) * 100);
@@ -1826,17 +2182,21 @@ function App() {
   }
 
   function updateNormalPositionFromPointer(event: React.PointerEvent<HTMLDivElement>) {
+    updateNormalPositionFromClientPoint(event.clientX, event.clientY);
+  }
+
+  function updateNormalPositionFromClientPoint(clientX: number, clientY: number) {
     if (mode === 'seam' || !draftSealSrc) return;
-    const rect = event.currentTarget.getBoundingClientRect();
-    const x = ((event.clientX - rect.left) / rect.width) * 100;
-    const y = ((event.clientY - rect.top) / rect.height) * 100;
-    const nextX = clampPercent(x);
-    const nextY = clampPercent(y);
-    if (mode === 'batch' && positionTarget === 'page') {
+    const position = normalPositionFromClientPoint(clientX, clientY);
+    if (!position) return;
+    const nextX = position.xPercent;
+    const nextY = position.yPercent;
+    if (mode === 'batch' && (positionTarget === 'page' || isEditingBatchAction)) {
       setOverridePage(currentPage || 1);
       setOverrideXPercent(nextX);
       setOverrideYPercent(nextY);
       setOverrideDraftTouched(true);
+      setPositionTarget('page');
       return;
     }
     setXPercent(nextX);
@@ -1856,7 +2216,49 @@ function App() {
     event.currentTarget.setPointerCapture(event.pointerId);
     updatePagePositionFromPointer(event);
     setIsPositioningStamp(true);
-    setStatus(mode === 'seam' ? '已更新骑缝章位置，确认后添加或保存。' : '已更新印章位置，确认后添加或保存。');
+    setStatus(mode === 'seam'
+      ? '已更新骑缝章位置，确认后添加或保存。'
+      : mode === 'batch' && (positionTarget === 'page' || isEditingBatchAction)
+        ? `已调整第 ${currentPage} 页印章位置，保存调整后生效。`
+        : '已更新印章位置，确认后添加或保存。');
+  }
+
+  function startExistingStampPositioning(event: React.PointerEvent<HTMLImageElement>, action: NormalStamp) {
+    if (event.button !== 0 || !action.pages.includes(currentPage)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pointerPosition = normalPositionFromClientPoint(event.clientX, event.clientY);
+    const pageElement = pageWrapRef.current;
+    if (!pointerPosition || !pageElement) return;
+    try {
+      pageElement.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is best-effort; the initial drag still enters edit mode.
+    }
+    setEditingActionId(action.id);
+    setSelectedSealKind(action.sealKind);
+    setXPercent(action.xPercent);
+    setYPercent(action.yPercent);
+    setSizePercent(action.sizePercent);
+    setSpecificPages(pagesToRangeText(action.pages));
+    setPagePositionOverrides(action.pageOverrides || {});
+    if (areContinuousPages(action.pages)) {
+      setMode('batch');
+      setBatchStart(action.pages[0]);
+      setBatchEnd(action.pages[action.pages.length - 1]);
+      setOverridePage(currentPage);
+      setOverrideXPercent(pointerPosition.xPercent);
+      setOverrideYPercent(pointerPosition.yPercent);
+      setOverrideDraftTouched(true);
+      setPositionTarget('page');
+      setStatus(`正在调整第 ${currentPage} 页${sealLabels[action.sealKind]}，保存调整后生效。`);
+    } else {
+      setMode('specific');
+      setXPercent(pointerPosition.xPercent);
+      setYPercent(pointerPosition.yPercent);
+      setStatus(`正在调整第 ${pagesToRangeText(action.pages)} 页${sealLabels[action.sealKind]}。`);
+    }
+    setIsPositioningStamp(true);
   }
 
   function savePagePositionOverride() {
@@ -1876,6 +2278,38 @@ function App() {
     setStatus(`已为第 ${pageNumber} 页保存单独印章位置。`);
   }
 
+  function persistPendingPagePositionOverride() {
+    if (mode !== 'batch' || positionTarget !== 'page' || !overrideDraftTouched) return false;
+    const minPage = Math.min(batchStart, batchEnd);
+    const maxPage = Math.max(batchStart, batchEnd);
+    const pageNumber = clampPercent(overridePage, minPage || 1, maxPage || pageCount || 1);
+    setPagePositionOverrides((list) => ({
+      ...list,
+      [pageNumber]: {
+        xPercent: clampPercent(overrideXPercent),
+        yPercent: clampPercent(overrideYPercent),
+      },
+    }));
+    setOverrideDraftTouched(false);
+    return true;
+  }
+
+  function goToPage(pageNumber: number) {
+    const nextPage = clampPercent(pageNumber, 1, pageCount || 1);
+    const saved = persistPendingPagePositionOverride();
+    setCurrentPage(nextPage);
+    if (saved) setStatus(`已自动保存第 ${overridePage} 页的单独印章位置。`);
+  }
+
+  function handleDocumentWheel(event: React.WheelEvent<HTMLElement>) {
+    if (!pdfDocument || Math.abs(event.deltaY) < 8) return;
+    event.preventDefault();
+    const now = Date.now();
+    if (now - lastWheelPageTurnRef.current < 360) return;
+    lastWheelPageTurnRef.current = now;
+    goToPage(currentPage + (event.deltaY > 0 ? 1 : -1));
+  }
+
   function clearPagePositionOverride() {
     setPagePositionOverrides((list) => {
       const next = { ...list };
@@ -1887,6 +2321,69 @@ function App() {
     setOverrideDraftTouched(false);
     setPositionTarget('default');
     setStatus(`已清除第 ${overridePage} 页的单独印章位置。`);
+  }
+
+  function pageOverridesWithPendingDrag(pages: number[]) {
+    const nextOverrides = { ...pagePositionOverrides };
+    if (positionTarget === 'page' && overrideDraftTouched) {
+      const minPage = Math.min(batchStart, batchEnd);
+      const maxPage = Math.max(batchStart, batchEnd);
+      const pageNumber = clampPercent(overridePage, minPage || 1, maxPage || pageCount || 1);
+      if (pages.includes(pageNumber)) {
+        nextOverrides[pageNumber] = {
+          xPercent: clampPercent(overrideXPercent),
+          yPercent: clampPercent(overrideYPercent),
+        };
+      }
+    }
+    return nextOverrides;
+  }
+
+  function actionsWithPendingEdit() {
+    const current = cloneStampActions(actions);
+    if (!editingActionId) return current;
+    if (mode === 'batch') {
+      const pages = rangePages(batchStart, batchEnd, pageCount);
+      if (!pages.length) return current;
+      const nextOverrides = normalizePageOverrides(pages, pageOverridesWithPendingDrag(pages), xPercent, yPercent);
+      const nextAction: StampAction = {
+        id: editingActionId,
+        type: 'normal',
+        pages,
+        sealKind: selectedSealKind,
+        xPercent,
+        yPercent,
+        sizePercent: currentSealSizePercent,
+        pageOverrides: nextOverrides,
+      };
+      return current.map((action) => (action.id === editingActionId ? nextAction : action));
+    }
+    if (mode === 'specific') {
+      const pages = parsePageList(specificPages, pageCount);
+      if (!pages.length) return current;
+      const nextAction: StampAction = {
+        id: editingActionId,
+        type: 'normal',
+        pages,
+        sealKind: selectedSealKind,
+        xPercent,
+        yPercent,
+        sizePercent: currentSealSizePercent,
+      };
+      return current.map((action) => (action.id === editingActionId ? nextAction : action));
+    }
+    const pages = rangePages(seamStart, seamEnd, pageCount);
+    if (!pages.length) return current;
+    const nextAction: StampAction = {
+      id: editingActionId,
+      type: 'seam',
+      pages,
+      splitCount: Math.max(1, Math.min(splitCount, pages.length)),
+      yPercent: seamY,
+      heightPercent: sealSizePercent('official', seamHeight, activeSubject?.sealSizes),
+      rightInsetPercent: seamInset,
+    };
+    return current.map((action) => (action.id === editingActionId ? nextAction : action));
   }
 
   function addStampAction() {
@@ -1902,7 +2399,7 @@ function App() {
     if (mode === 'batch') {
       const pages = rangePages(batchStart, batchEnd, pageCount);
       const id = editingActionId || uid('stamp');
-      const nextOverrides = normalizePageOverrides(pages, pagePositionOverrides, xPercent, yPercent);
+      const nextOverrides = normalizePageOverrides(pages, pageOverridesWithPendingDrag(pages), xPercent, yPercent);
       const nextAction: StampAction = { id, type: 'normal', pages, sealKind: selectedSealKind, xPercent, yPercent, sizePercent: currentSealSizePercent, pageOverrides: nextOverrides };
       commitActions((list) => (editingActionId
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
@@ -2044,6 +2541,7 @@ function App() {
     });
     const newRecord: ExportRecord = {
       id: uid('record'),
+      kind: 'export',
       name: downloadName,
       subjectName: activeSubject.name,
       pageCount,
@@ -2056,14 +2554,46 @@ function App() {
   }
 
   function redownloadRecord(record: ExportRecord) {
+    if (!record.dataUrl) {
+      setStatus('这条记录是用章流程，请点击继续恢复编辑。');
+      return;
+    }
     downloadBlob(new Blob([dataUrlToBytes(record.dataUrl)], { type: 'application/pdf' }), record.name);
     setStatus(`已重新下载：${record.name}`);
+  }
+
+  async function resumeWorkflowRecord(record: ExportRecord) {
+    if (!record.sourcePdfDataUrl || record.kind !== 'workflow') {
+      setStatus('这条记录没有可恢复的用章流程。');
+      return;
+    }
+    if (pdfDocument) {
+      const confirmed = await requestConfirm({
+        title: '恢复用章流程',
+        message: `恢复“${record.sourcePdfName || record.name}”会替换当前正在处理的 PDF，是否继续？`,
+        confirmText: '恢复',
+      });
+      if (!confirmed) return;
+    }
+    const bytes = dataUrlToBytes(record.sourcePdfDataUrl);
+    if (record.activeSubjectId && subjects.some((subject) => subject.id === record.activeSubjectId)) {
+      setActiveSubjectId(record.activeSubjectId);
+    }
+    await loadPdfWorkspace({
+      bytes,
+      name: record.sourcePdfName || record.name.replace(/\s*·\s*用章流程$/, ''),
+      actions: record.actions || [],
+      exportName: record.exportName,
+      currentPage: record.currentPage,
+    });
+    setSideView('subjects');
+    setStatus(`已恢复用章流程：${record.sourcePdfName || record.name}`);
   }
 
   async function deleteRecord(record: ExportRecord) {
     const confirmed = await requestConfirm({
       title: '删除记录',
-      message: `确定删除导出记录“${record.name}”？删除后无法再次下载该文件。`,
+      message: `确定删除${record.kind === 'workflow' ? '用章流程' : '导出记录'}“${record.name}”？删除后无法恢复。`,
       confirmText: '删除',
       tone: 'danger',
     });
@@ -2072,25 +2602,156 @@ function App() {
     setStatus(`已删除记录：${record.name}`);
   }
 
-  const effectiveZoom = fitWidth ? renderPage.scale : zoom;
+  function exportSubjectMaterials() {
+    if (!subjects.length) {
+      setStatus('暂无主体可导出。');
+      return;
+    }
+
+    const encoder = new TextEncoder();
+    const usedPaths = new Set<string>(['corpseals-materials.json']);
+    const usedFolders = new Set<string>();
+    const files: ZipFileEntry[] = [];
+    const manifest: MaterialPackageManifest = {
+      app: 'CorpSeals',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      subjects: [],
+    };
+
+    subjects.forEach((subject, subjectIndex) => {
+      const baseFolder = sanitizeFileSegment(subject.name, `主体-${subjectIndex + 1}`);
+      let folder = baseFolder;
+      let folderIndex = 2;
+      while (usedFolders.has(folder)) {
+        folder = `${baseFolder}-${folderIndex}`;
+        folderIndex += 1;
+      }
+      usedFolders.add(folder);
+
+      const subjectEntry: MaterialSubjectEntry = {
+        name: subject.name,
+        sealSizes: subject.sealSizes,
+        seals: [],
+        qualifications: [],
+      };
+
+      sealKindList.forEach((kind) => {
+        const dataUrl = subject.seals[kind];
+        if (!dataUrl) return;
+        const mimeType = dataUrlMime(dataUrl);
+        const extension = fileExtensionFromMime(mimeType);
+        const file = uniquePath(`${folder}/印章/${sealLabels[kind]}.${extension}`, usedPaths);
+        files.push({ path: file, data: dataUrlToBytes(dataUrl) });
+        subjectEntry.seals.push({
+          kind,
+          file,
+          mimeType,
+          sizeMm: subject.sealSizes?.[kind],
+        });
+      });
+
+      (subject.qualifications || []).forEach((qualification, qualificationIndex) => {
+        const mimeType = qualification.mimeType || dataUrlMime(qualification.dataUrl);
+        const extension = fileExtensionFromMime(mimeType);
+        const fallbackName = `主体资质-${qualificationIndex + 1}.${extension}`;
+        const name = sanitizeFileSegment(qualification.name, fallbackName);
+        const file = uniquePath(`${folder}/主体资质/${name}`, usedPaths);
+        files.push({ path: file, data: dataUrlToBytes(qualification.dataUrl) });
+        subjectEntry.qualifications.push({
+          file,
+          name: qualification.name,
+          mimeType,
+          purpose: qualification.purpose,
+          addSeal: qualification.addSeal,
+          addWatermark: qualification.addWatermark,
+          sealPosition: qualification.sealPosition,
+        });
+      });
+
+      manifest.subjects.push(subjectEntry);
+    });
+
+    files.unshift({
+      path: 'corpseals-materials.json',
+      data: encoder.encode(JSON.stringify(manifest, null, 2)),
+    });
+
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    downloadBlob(new Blob([createZip(files)], { type: 'application/zip' }), `CorpSeals主体资料包_${today}.zip`);
+    setStatus(`已导出 ${manifest.subjects.length} 个主体资料包，可在其他电脑导入。`);
+  }
+
+  async function importSubjectMaterials(file: File) {
+    try {
+      const entries = parseZip(new Uint8Array(await file.arrayBuffer()));
+      const manifestBytes = entries.get('corpseals-materials.json');
+      if (!manifestBytes) throw new Error('资料包缺少清单文件。');
+
+      const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as MaterialPackageManifest;
+      if (manifest.app !== 'CorpSeals' || manifest.version !== 1 || !Array.isArray(manifest.subjects)) {
+        throw new Error('资料包格式不匹配，请选择 CorpSeals 导出的主体资料包。');
+      }
+
+      const importedSubjects: Subject[] = manifest.subjects.map((entry, index) => {
+        const seals: Partial<Record<SealKind, string>> = {};
+        const sealSizes: Partial<Record<SealKind, number>> = {};
+
+        entry.seals.forEach((seal) => {
+          if (!sealKindList.includes(seal.kind)) return;
+          const bytes = entries.get(seal.file);
+          if (!bytes) throw new Error(`资料包缺少印章文件：${seal.file}`);
+          seals[seal.kind] = bytesToDataUrl(bytes, seal.mimeType);
+          if (seal.sizeMm) sealSizes[seal.kind] = seal.sizeMm;
+        });
+
+        const qualifications = entry.qualifications.map((qualification) => {
+          const bytes = entries.get(qualification.file);
+          if (!bytes) throw new Error(`资料包缺少主体资质文件：${qualification.file}`);
+          return {
+            id: uid('qualification'),
+            name: qualification.name,
+            mimeType: qualification.mimeType,
+            dataUrl: bytesToDataUrl(bytes, qualification.mimeType),
+            purpose: qualification.purpose,
+            addSeal: qualification.addSeal,
+            addWatermark: qualification.addWatermark,
+            sealPosition: qualification.sealPosition,
+          };
+        });
+
+        return {
+          id: uid('subject'),
+          name: entry.name || `导入主体-${index + 1}`,
+          seals,
+          sealSizes: Object.keys(sealSizes).length ? sealSizes : undefined,
+          qualifications,
+        };
+      });
+
+      if (!importedSubjects.length) {
+        setStatus('资料包中没有可导入的主体。');
+        return;
+      }
+
+      setSubjects((list) => {
+        const byName = new Map(list.map((subject) => [subject.name, subject]));
+        importedSubjects.forEach((subject) => byName.set(subject.name, subject));
+        return Array.from(byName.values());
+      });
+      setActiveSubjectId(importedSubjects[0].id);
+      setSideView('subjects');
+      setStatus(`已导入 ${importedSubjects.length} 个主体资料，可继续快速用章。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '导入主体资料包失败。');
+    }
+  }
 
   function changeZoom(delta: number) {
-    const base = fitWidth ? renderPage.scale : zoom;
+    const base = fitWidth ? 1 : zoom;
     const next = Math.min(4, Math.max(0.2, Math.round((base + delta) * 100) / 100));
     setFitWidth(false);
     setZoom(next);
-  }
-
-  function applyZoomChoice(choice: string) {
-    if (choice === 'fit') {
-      setFitWidth(true);
-      return;
-    }
-    const value = Number(choice);
-    if (Number.isFinite(value) && value > 0) {
-      setFitWidth(false);
-      setZoom(value);
-    }
   }
 
   async function toggleFullscreen() {
@@ -2275,8 +2936,8 @@ function App() {
                 </div>
               </section>
 
-              <section className="subject-list">
-                {subjects.map((subject) => (
+	              <section className="subject-list">
+	                {subjects.map((subject) => (
                   <div
                     className={`subject-row ${subject.id === activeSubject?.id ? 'active' : ''}`}
                     key={subject.id}
@@ -2304,7 +2965,7 @@ function App() {
                 {!subjects.length && <div className="empty">还没有主体。先添加一个主体，再上传印章。</div>}
               </section>
 
-              {activeSubject && (
+	              {activeSubject && (
                 <section className="panel seal-panel">
                   <div className="section-title">
                     <BadgeCheck size={16} />
@@ -2385,7 +3046,7 @@ function App() {
                 <small>{records.length} 条</small>
               </div>
               <div className="record-intro">
-                每次导出盖章 PDF 都会自动留存在这里，可随时重新下载。最多保留最近 50 条。
+                导出的盖章 PDF 和关闭保存的用章流程都会留存在这里。最多保留最近 50 条。
               </div>
               <div className="record-file-list">
                 {records.map((record) => (
@@ -2394,23 +3055,32 @@ function App() {
                       <FileText size={16} />
                       <div className="record-file-text">
                         <strong title={record.name}>{record.name}</strong>
-                        <span>{record.subjectName} · {record.pageCount} 页 · {record.actionCount} 个用章</span>
+                        <span>
+                          {record.kind === 'workflow' ? '用章流程' : '导出文件'} · {record.subjectName} · {record.pageCount} 页 · {record.actionCount} 个用章
+                        </span>
                         <small>{record.createdAt}</small>
                       </div>
                     </div>
                     <div className="record-file-actions">
-                      <button className="button" onClick={() => redownloadRecord(record)}>
-                        <Download size={14} />
-                        下载
-                      </button>
+                      {record.kind === 'workflow' ? (
+                        <button className="button" onClick={() => resumeWorkflowRecord(record)}>
+                          <FileText size={14} />
+                          继续
+                        </button>
+                      ) : (
+                        <button className="button" onClick={() => redownloadRecord(record)}>
+                          <Download size={14} />
+                          下载
+                        </button>
+                      )}
                       <button className="icon-button danger-action" title="删除记录" onClick={() => deleteRecord(record)}>
                         <Trash2 size={14} />
                       </button>
                     </div>
                   </div>
                 ))}
-                {!records.length && <div className="empty">暂无用章文件记录。导出盖章 PDF 后会显示在这里。</div>}
-              </div>
+                {!records.length && <div className="empty">暂无用章文件记录。导出 PDF 或关闭保存流程后会显示在这里。</div>}
+	              </div>
             </section>
           )}
 
@@ -2423,33 +3093,50 @@ function App() {
               <div className="settings-list">
                 <div className="settings-row">
                   <div>
-                    <strong>当前主体</strong>
-                    <span>{activeSubject?.name || '暂无主体'}</span>
+                    <strong>界面配色</strong>
+                    <span>选择侧边栏、按钮和高亮色，红色为默认配色</span>
                   </div>
-                  <button className="button danger-action" disabled={!activeSubject} onClick={() => activeSubject && deleteSubject(activeSubject.id)}>
-                    <Trash2 size={15} />
-                    删除
-                  </button>
+                  <div className="theme-options" role="group" aria-label="界面配色">
+                    {colorThemeList.map((theme) => (
+                      <button
+                        key={theme}
+                        type="button"
+                        className={`theme-option theme-option-${theme} ${colorTheme === theme ? 'active' : ''}`}
+                        onClick={() => setColorTheme(theme)}
+                        aria-pressed={colorTheme === theme}
+                      >
+                        <span className="theme-dot" />
+                        {colorThemeLabels[theme]}
+                      </button>
+                    ))}
+                  </div>
                 </div>
                 <div className="settings-row">
                   <div>
-                    <strong>盖章记录</strong>
-                    <span>{actions.length ? `已有 ${actions.length} 条操作` : '暂无操作'}</span>
+                    <strong>主体资料包</strong>
+                    <span>{subjects.length ? `可导出 ${subjects.length} 个主体的印章和资质材料` : '暂无主体可导出'}</span>
                   </div>
-                  <button className="button" disabled={!actions.length} onClick={clearActions}>
-                    <RotateCcw size={15} />
-                    清空
-                  </button>
-                </div>
-                <div className="settings-row">
-                  <div>
-                    <strong>主体数据</strong>
-                    <span>{subjects.length ? `已保存 ${subjects.length} 个主体` : '暂无主体'}</span>
+                  <div className="settings-actions">
+                    <button className="button" disabled={!subjects.length} onClick={exportSubjectMaterials}>
+                      <Download size={15} />
+                      导出
+                    </button>
+                    <button className="button" onClick={() => materialImportInputRef.current?.click()}>
+                      <Upload size={15} />
+                      导入
+                    </button>
+                    <input
+                      ref={materialImportInputRef}
+                      type="file"
+                      accept=".zip,application/zip"
+                      style={{ display: 'none' }}
+                      onChange={async (event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = '';
+                        if (file) await importSubjectMaterials(file);
+                      }}
+                    />
                   </div>
-                  <button className="button danger-action" disabled={!subjects.length} onClick={clearSubjects}>
-                    <Trash2 size={15} />
-                    全部删除
-                  </button>
                 </div>
                 <div className="settings-row">
                   <div>
@@ -2458,6 +3145,16 @@ function App() {
                       {storageInfo?.dataFilePath || '浏览器本地数据'}
                     </span>
                   </div>
+                </div>
+                <div className="settings-row settings-danger-row">
+                  <div>
+                    <strong>危险区</strong>
+                    <span>{subjects.length ? `删除全部 ${subjects.length} 个主体、印章和资质材料` : '暂无主体数据'}</span>
+                  </div>
+                  <button className="button danger-action" disabled={!subjects.length} onClick={clearSubjects}>
+                    <Trash2 size={15} />
+                    全部删除主体
+                  </button>
                 </div>
               </div>
 
@@ -2620,19 +3317,21 @@ function App() {
         ) : (
           <>
             <div className="document-toolbar">
-              <button className="icon-button" onClick={() => setCurrentPage((page) => Math.max(1, page - 1))} title="上一页">
-                <ChevronLeft size={16} />
-              </button>
-              <button className="icon-button" onClick={() => setCurrentPage((page) => Math.min(pageCount || 1, page + 1))} title="下一页">
-                <ChevronRight size={16} />
-              </button>
+              <div className="toolbar-button-group" aria-label="翻页控制">
+                <button className="icon-button" onClick={() => goToPage(currentPage - 1)} title="上一页">
+                  <ChevronLeft size={15} />
+                </button>
+                <button className="icon-button" onClick={() => goToPage(currentPage + 1)} title="下一页">
+                  <ChevronRight size={15} />
+                </button>
+              </div>
               <div className="page-counter">
                 <input
                   type="number"
                   min={1}
                   max={pageCount || 1}
                   value={currentPage}
-                  onChange={(event) => setCurrentPage(clampPercent(Number(event.target.value), 1, pageCount || 1))}
+                  onChange={(event) => goToPage(Number(event.target.value))}
                 />
                 <span>/ {pageCount || 0}</span>
               </div>
@@ -2669,26 +3368,11 @@ function App() {
                 </>
               )}
               <span className="toolbar-divider" />
-              <button className="icon-button" title="缩小" disabled={!pdfDocument} onClick={() => changeZoom(-0.1)}><Minus size={16} /></button>
-              <select
-                className="zoom-select"
-                value={fitWidth ? 'fit' : String(zoom)}
-                onChange={(event) => applyZoomChoice(event.target.value)}
-              >
-                <option value="fit">适合宽度</option>
-                <option value="0.5">50%</option>
-                <option value="0.75">75%</option>
-                <option value="1">100%</option>
-                <option value="1.25">125%</option>
-                <option value="1.5">150%</option>
-                <option value="2">200%</option>
-                {!fitWidth && ![0.5, 0.75, 1, 1.25, 1.5, 2].includes(zoom) && (
-                  <option value={String(zoom)}>{Math.round(zoom * 100)}%</option>
-                )}
-              </select>
-              <button className="icon-button" title="放大" disabled={!pdfDocument} onClick={() => changeZoom(0.1)}><Plus size={16} /></button>
-              <button className={`button toolbar-fit ${fitWidth ? 'active' : ''}`} type="button" disabled={!pdfDocument} onClick={() => setFitWidth(true)}>适合宽度</button>
-              <span className="zoom-readout">{Math.round(effectiveZoom * 100)}%</span>
+              <div className="toolbar-button-group" aria-label="缩放控制">
+                <button className="icon-button zoom-step-button" title="缩小" disabled={!pdfDocument} onClick={() => changeZoom(-0.1)}><Minus size={15} /></button>
+                <button className="icon-button zoom-step-button" title="放大" disabled={!pdfDocument} onClick={() => changeZoom(0.1)}><Plus size={15} /></button>
+              </div>
+              <button className={`button toolbar-fit ${fitWidth ? 'active' : ''}`} type="button" disabled={!pdfDocument} onClick={() => setFitWidth(true)}>Auto</button>
               <button className="icon-button" title={isFullscreen ? '退出全屏' : '全屏预览'} disabled={!pdfDocument} onClick={toggleFullscreen}><Maximize2 size={16} /></button>
             </div>
 
@@ -2698,19 +3382,22 @@ function App() {
                   <button
                     key={page}
                     className={page === currentPage ? 'active' : ''}
-                    onClick={() => setCurrentPage(page)}
+                    onClick={() => goToPage(page)}
                   >
                     <span>{page}</span>
                   </button>
                 ))}
               </nav>
 
-              <section className="document-stage" ref={documentStageRef}>
+              <section className="document-stage" ref={documentStageRef} onWheel={handleDocumentWheel}>
                 {!pdfDocument ? (
                   <div className="drop-zone" onClick={() => fileInputRef.current?.click()}>
-                    <Upload size={34} />
+                    <span className="drop-zone-icon">
+                      <Upload size={34} />
+                    </span>
                     <strong>上传 PDF 后开始盖章</strong>
-                    <span>支持批量、指定页、多类型印章和右侧骑缝章</span>
+                    <span>支持批量、指定页、多类型印章和骑缝章</span>
+                    <em>PDF</em>
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -2722,89 +3409,92 @@ function App() {
                     />
                   </div>
                 ) : (
-              <div
-                className={`page-wrap ${canPositionOnPage ? 'can-position-stamp' : ''} ${shouldShowDraftSeam ? 'can-position-seam' : ''}`}
-                onPointerDown={startPagePositioning}
-                onPointerMove={(event) => {
-                  if (isPositioningStamp) updatePagePositionFromPointer(event);
-                }}
-                onPointerUp={() => setIsPositioningStamp(false)}
-                onPointerCancel={() => setIsPositioningStamp(false)}
-              >
-                <PageCanvas pdfDocument={pdfDocument} pageNumber={currentPage} zoom={zoom} fitWidth={fitWidth} onRendered={setRenderPage} />
-                {currentActions.filter((action) => action.id !== editingActionId).map((action) => {
-                  if (!activeSubject) return null;
-                  if (action.type === 'normal') {
-                    const sealSrc = activeSubject.seals[action.sealKind];
-                    if (!sealSrc) return null;
-                    const width = (renderPage.width * sealSizePercent(action.sealKind, action.sizePercent, activeSubject.sealSizes)) / 100;
-                    const height = width;
-                    const position = pagePosition(action, currentPage);
-                    return (
-                      <img
-                        key={action.id}
-                        className="stamp-preview"
-                        src={sealSrc}
-                        alt="stamp"
+                  <div
+                    className={`page-wrap ${canPositionOnPage ? 'can-position-stamp' : ''} ${shouldShowDraftSeam ? 'can-position-seam' : ''}`}
+                    ref={pageWrapRef}
+                    onPointerDown={startPagePositioning}
+                    onPointerMove={(event) => {
+                      if (isPositioningStamp) updatePagePositionFromPointer(event);
+                    }}
+                    onPointerUp={() => setIsPositioningStamp(false)}
+                    onPointerCancel={() => setIsPositioningStamp(false)}
+                  >
+                    <PageCanvas pdfDocument={pdfDocument} pageNumber={currentPage} zoom={zoom} fitWidth={fitWidth} onRendered={setRenderPage} />
+                    {currentActions.filter((action) => action.id !== editingActionId).map((action) => {
+                      if (!activeSubject) return null;
+                      if (action.type === 'normal') {
+                        const sealSrc = activeSubject.seals[action.sealKind];
+                        if (!sealSrc) return null;
+                        const width = (renderPage.width * sealSizePercent(action.sealKind, action.sizePercent, activeSubject.sealSizes)) / 100;
+                        const height = width;
+                        const position = pagePosition(action, currentPage);
+                        return (
+                          <img
+                            key={action.id}
+                            className="stamp-preview interactive-stamp-preview"
+                            src={sealSrc}
+                            alt="stamp"
+                            draggable={false}
+                            onPointerDown={(event) => startExistingStampPositioning(event, action)}
+                            style={{
+                              width,
+                              height,
+                              left: `${position.xPercent}%`,
+                              top: `${position.yPercent}%`,
+                            }}
+                          />
+                        );
+                      }
+                      if (!activeSubject.seals.official) return null;
+                      const localIndex = action.pages.indexOf(currentPage);
+                      if (localIndex < 0) return null;
+                      const slice = seamSliceInfo(action.pages.length, action.splitCount, localIndex);
+                      const previewHeight = (renderPage.width * sealSizePercent('official', action.heightPercent, activeSubject.sealSizes)) / 100;
+                      const width = Math.max(12, previewHeight / slice.groupSize);
+                      return (
+                        <div
+                          key={action.id}
+                          className="seam-preview"
+                          style={{
+                            width,
+                            height: previewHeight,
+                            top: `${action.yPercent}%`,
+                            right: `${-action.rightInsetPercent}%`,
+                            backgroundImage: `url(${activeSubject.seals.official})`,
+                            backgroundSize: `${slice.groupSize * 100}% 100%`,
+                            backgroundPosition: `${(slice.sliceIndex / Math.max(1, slice.groupSize - 1)) * 100}% 0`,
+                          }}
+                        />
+                      );
+                    })}
+                    {shouldShowDraftSeam && activeSubject?.seals.official && draftSeamSlice && (
+                      <div
+                        className="seam-preview draft-seam-preview"
                         style={{
-                          width,
-                          height,
-                          left: `${position.xPercent}%`,
-                          top: `${position.yPercent}%`,
+                          width: draftSeamWidth,
+                          height: draftSeamHeight,
+                          top: `${seamY}%`,
+                          right: `${-seamInset}%`,
+                          backgroundImage: `url(${activeSubject.seals.official})`,
+                          backgroundSize: `${draftSeamSlice.groupSize * 100}% 100%`,
+                          backgroundPosition: `${(draftSeamSlice.sliceIndex / Math.max(1, draftSeamSlice.groupSize - 1)) * 100}% 0`,
                         }}
                       />
-                    );
-                  }
-                  if (!activeSubject.seals.official) return null;
-                  const localIndex = action.pages.indexOf(currentPage);
-                  if (localIndex < 0) return null;
-                  const slice = seamSliceInfo(action.pages.length, action.splitCount, localIndex);
-                  const previewHeight = (renderPage.width * sealSizePercent('official', action.heightPercent, activeSubject.sealSizes)) / 100;
-                  const width = Math.max(12, previewHeight / slice.groupSize);
-                  return (
-                    <div
-                      key={action.id}
-                      className="seam-preview"
-                      style={{
-                        width,
-                        height: previewHeight,
-                        top: `${action.yPercent}%`,
-                        right: `${-action.rightInsetPercent}%`,
-                        backgroundImage: `url(${activeSubject.seals.official})`,
-                        backgroundSize: `${slice.groupSize * 100}% 100%`,
-                        backgroundPosition: `${(slice.sliceIndex / Math.max(1, slice.groupSize - 1)) * 100}% 0`,
-                      }}
-                    />
-                  );
-                })}
-                {shouldShowDraftSeam && activeSubject?.seals.official && draftSeamSlice && (
-                  <div
-                    className="seam-preview draft-seam-preview"
-                    style={{
-                      width: draftSeamWidth,
-                      height: draftSeamHeight,
-                      top: `${seamY}%`,
-                      right: `${-seamInset}%`,
-                      backgroundImage: `url(${activeSubject.seals.official})`,
-                      backgroundSize: `${draftSeamSlice.groupSize * 100}% 100%`,
-                      backgroundPosition: `${(draftSeamSlice.sliceIndex / Math.max(1, draftSeamSlice.groupSize - 1)) * 100}% 0`,
-                    }}
-                  />
-                )}
-                {shouldShowDraftStamp && (
-                  <img
-                    className="stamp-preview draft-stamp-preview"
-                    src={draftSealSrc}
-                    alt="stamp draft"
-                    style={{
-                      width: (renderPage.width * currentSealSizePercent) / 100,
-                      height: (renderPage.width * currentSealSizePercent) / 100,
-                      left: `${effectiveDraftXPercent}%`,
-                      top: `${effectiveDraftYPercent}%`,
-                    }}
-                  />
-                )}
-              </div>
+                    )}
+                    {shouldShowDraftStamp && (
+                      <img
+                        className="stamp-preview draft-stamp-preview"
+                        src={draftSealSrc}
+                        alt="stamp draft"
+                        style={{
+                          width: (renderPage.width * currentSealSizePercent) / 100,
+                          height: (renderPage.width * currentSealSizePercent) / 100,
+                          left: `${effectiveDraftXPercent}%`,
+                          top: `${effectiveDraftYPercent}%`,
+                        }}
+                      />
+                    )}
+                  </div>
             )}
           </section>
         </div>
@@ -2877,7 +3567,7 @@ function App() {
                   <button className={positionTarget === 'default' ? 'active' : ''} type="button" onClick={() => setPositionTarget('default')}>
                     默认位置
                   </button>
-                  <button className={positionTarget === 'page' ? 'active' : ''} type="button" onClick={() => { setPositionTarget('page'); setCurrentPage(overridePage); }}>
+                  <button className={positionTarget === 'page' ? 'active' : ''} type="button" onClick={() => { setPositionTarget('page'); goToPage(overridePage); }}>
                     本页位置
                   </button>
                 </div>
@@ -2893,9 +3583,8 @@ function App() {
                       const maxPage = Math.max(batchStart, batchEnd) || pageCount || 1;
                       const pageNumber = clampPercent(Number(event.target.value), minPage, maxPage);
                       setOverridePage(pageNumber);
-                      setCurrentPage(pageNumber);
+                      goToPage(pageNumber);
                       setPositionTarget('page');
-                      setOverrideDraftTouched(true);
                     }}
                   />
                 </label>
@@ -2948,9 +3637,10 @@ function App() {
           </button>
         )}
 
-        <section className="history op-list">
-          <div className="section-title op-list-head">
-            <span>已添加操作</span>
+	        <section className="history op-list">
+	          <div className="section-title op-list-head">
+	            <Stamp size={16} />
+	            <span>已添加操作</span>
             {actions.length > 0 && <small>{actions.length} 条</small>}
             {actions.length > 0 && (
               <button className="op-clear-button" type="button" onClick={clearActions} title="清除所有操作">
@@ -2998,6 +3688,21 @@ function App() {
           })}
           {!actions.length && <div className="empty">暂无盖章操作。</div>}
         </section>
+
+        {pdfDocument && (
+          <section className="history workflow-panel">
+            <div className="section-title">
+              <FileText size={16} />
+              <span>当前用章流程</span>
+              <small>{actions.length} 条操作</small>
+            </div>
+            <div className="workflow-file-name" title={pdfName}>{pdfName || '未命名 PDF'}</div>
+            <button className="button full secondary-action" onClick={closeCurrentWorkflow}>
+              <X size={15} />
+              关闭并保存流程
+            </button>
+          </section>
+        )}
 
         <div className="status">{status}</div>
       </aside>
