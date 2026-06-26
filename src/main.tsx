@@ -10,12 +10,20 @@ import {
   Download,
   FileText,
   Layers3,
+  Lock,
   LogOut,
   Maximize2,
+  ArrowRight,
   Minus,
+  User,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Pin,
+  PinOff,
   Settings,
   Plus,
   RotateCcw,
+  RotateCw,
   Redo2,
   Save,
   Scissors,
@@ -63,12 +71,22 @@ type LoginCredentials = {
   password: string;
 };
 
+type CustomSeal = {
+  id: string;
+  name: string;
+  dataUrl: string;
+  widthMm: number;
+  aspect: number; // 高 / 宽，用于保持上传图片的原始比例
+};
+
 type Subject = {
   id: string;
   name: string;
   seals: Partial<Record<SealKind, string>>;
   sealSizes?: Partial<Record<SealKind, number>>;
+  customSeals?: CustomSeal[];
   qualifications?: Qualification[];
+  pinned?: boolean;
 };
 
 type SealPosition = 'tl' | 'tr' | 'bl' | 'br' | 'center';
@@ -137,6 +155,10 @@ type NormalStamp = {
   yPercent: number;
   sizePercent: number;
   pageOverrides?: Record<number, PagePositionOverride>;
+  // 自定义印章相关：存在 customSealId 时，sealKind 被忽略，改用自定义章。
+  customSealId?: string;
+  customWidthPercent?: number; // 宽度占页面宽度的百分比（可拖拽缩放）
+  customAspect?: number; // 高 / 宽
 };
 
 type PagePositionOverride = {
@@ -187,6 +209,7 @@ type PersistedAppData = {
   records?: ExportRecord[];
   colorTheme?: ColorTheme;
   loginCredentials?: LoginCredentials;
+  sidebarCollapsed?: boolean;
 };
 
 type StorageInfo = {
@@ -233,7 +256,7 @@ const sealLabels: Record<SealKind, string> = {
 };
 const sealKindList = Object.keys(sealLabels) as SealKind[];
 const colorThemeLabels: Record<ColorTheme, string> = {
-  red: '红色',
+  red: '默认',
   green: '深绿',
   purple: '紫色',
 };
@@ -248,6 +271,10 @@ const DEFAULT_SEAL_MM: Record<SealKind, number> = {
   legal: 18,
 };
 const SEAL_SIZE_PRESETS = [42, 40, 36, 22, 18];
+const MAX_PINNED_SUBJECTS = 2;
+const DEFAULT_CUSTOM_SEAL_MM = 40;
+const MIN_CUSTOM_WIDTH_PERCENT = 3;
+const MAX_CUSTOM_WIDTH_PERCENT = 90;
 const MAX_ACTION_HISTORY = 50;
 
 type SealSizes = Partial<Record<SealKind, number>>;
@@ -270,6 +297,35 @@ function sealSizePercent(kind: SealKind, _fallbackPercent: number, sizes?: SealS
 function sealSizeText(kind: SealKind, sizes?: SealSizes) {
   const mm = sealMm(kind, sizes);
   return `${mm}mm × ${mm}mm`;
+}
+
+function mmToWidthPercent(mm: number) {
+  return (clampCustomSealMm(mm) / A4_WIDTH_MM) * 100;
+}
+
+function clampCustomSealMm(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_CUSTOM_SEAL_MM;
+  return Math.min(MAX_SEAL_MM, Math.max(MIN_SEAL_MM, Math.round(value)));
+}
+
+function findCustomSeal(subject: Subject | undefined, id?: string) {
+  if (!subject || !id) return undefined;
+  return subject.customSeals?.find((seal) => seal.id === id);
+}
+
+// 统一解析一个普通盖章动作的图片源、宽度百分比与宽高比，预览与导出共用。
+function resolveStampVisual(action: NormalStamp, subject: Subject | undefined) {
+  if (action.customSealId) {
+    const custom = findCustomSeal(subject, action.customSealId);
+    if (!custom) return null;
+    const widthPercent = action.customWidthPercent ?? mmToWidthPercent(custom.widthMm);
+    const aspect = action.customAspect ?? custom.aspect ?? 1;
+    return { src: custom.dataUrl, widthPercent, aspect };
+  }
+  const src = subject?.seals[action.sealKind];
+  if (!src) return null;
+  const widthPercent = sealSizePercent(action.sealKind, action.sizePercent, subject?.sealSizes);
+  return { src, widthPercent, aspect: 1 };
 }
 
 function cloneStampActions(list: StampAction[]) {
@@ -347,7 +403,7 @@ function normalizePersistedAppData(value: PersistedAppData | null | undefined): 
     : DEFAULT_LOGIN_CREDENTIALS;
   return {
     subjects: Array.isArray(value.subjects)
-      ? value.subjects.map((subject) => ({ ...subject, qualifications: subject.qualifications || [] }))
+      ? value.subjects.map((subject) => ({ ...subject, customSeals: subject.customSeals || [], qualifications: subject.qualifications || [] }))
       : [],
     activeSubjectId: value.activeSubjectId || '',
     actions: Array.isArray(value.actions) ? value.actions : [],
@@ -355,6 +411,7 @@ function normalizePersistedAppData(value: PersistedAppData | null | undefined): 
     records: Array.isArray(value.records) ? value.records : [],
     colorTheme,
     loginCredentials,
+    sidebarCollapsed: Boolean(value.sidebarCollapsed),
   };
 }
 
@@ -513,15 +570,11 @@ async function generateSealFromScan(file: File, squareOutput: boolean) {
 
   const imageData = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
   const { data, width, height } = imageData;
-  let minX = width;
-  let minY = height;
-  let maxX = 0;
-  let maxY = 0;
   let inkPixels = 0;
+  // 「强红核心」标记：饱和度很高、红优势大的像素——印章主体由它构成；淡水印不属于它。
+  const strong = new Uint8Array(width * height);
 
   for (let index = 0; index < data.length; index += 4) {
-    const x = (index / 4) % width;
-    const y = Math.floor(index / 4 / width);
     const r = data[index];
     const g = data[index + 1];
     const b = data[index + 2];
@@ -529,8 +582,9 @@ async function generateSealFromScan(file: File, squareOutput: boolean) {
     const min = Math.min(r, g, b);
     const saturation = max ? (max - min) / max : 0;
     const redDominance = r - Math.max(g, b);
-    const redInk = r > 70 && saturation > 0.16 && redDominance > 14 && r > g * 1.08 && r > b * 1.04;
-    const darkRedInk = r > 95 && g < 135 && b < 135 && r > g * 1.18 && r > b * 1.12;
+    // 保留范围适当放宽以保住印章清晰边缘，淡水印交由后续「孤立弱红」清理。
+    const redInk = r > 90 && saturation > 0.5 && redDominance > 55 && r > g * 1.5 && r > b * 1.42;
+    const darkRedInk = r > 95 && g < 110 && b < 110 && r > g * 1.42 && r > b * 1.34;
     const keep = redInk || darkRedInk;
     if (keep) {
       const alpha = clampByte((redDominance + saturation * 130 - 20) * 1.7);
@@ -538,10 +592,7 @@ async function generateSealFromScan(file: File, squareOutput: boolean) {
       data[index + 1] = clampByte(g * 0.34);
       data[index + 2] = clampByte(b * 0.38 + 18);
       data[index + 3] = Math.max(95, alpha);
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x);
-      maxY = Math.max(maxY, y);
+      if (saturation > 0.62 && redDominance > 75) strong[index / 4] = 1;
       inkPixels += 1;
     } else {
       data[index + 3] = 0;
@@ -553,29 +604,155 @@ async function generateSealFromScan(file: File, squareOutput: boolean) {
     throw new Error('未识别到足够清晰的红色印文');
   }
 
-  const rowCounts = new Array<number>(height).fill(0);
-  const colCounts = new Array<number>(width).fill(0);
-  for (let index = 0; index < data.length; index += 4) {
-    if (data[index + 3] < 50) continue;
-    const x = (index / 4) % width;
-    const y = Math.floor(index / 4 / width);
-    rowCounts[y] += 1;
-    colCounts[x] += 1;
+  // 去除「孤立的弱红」：弱红像素（未达强红标准）只有在邻域内存在强红时才保留（这是
+  // 印章本体的抗锯齿边缘）；否则视为不依附印章的淡水印文字，删除。
+  const dilate = 3;
+  for (let pidx = 0; pidx < width * height; pidx += 1) {
+    if (data[pidx * 4 + 3] === 0 || strong[pidx]) continue;
+    const px = pidx % width;
+    const py = Math.floor(pidx / width);
+    let nearStrong = false;
+    for (let dy = -dilate; dy <= dilate && !nearStrong; dy += 1) {
+      const yy = py + dy;
+      if (yy < 0 || yy >= height) continue;
+      const rowBase = yy * width;
+      for (let dx = -dilate; dx <= dilate; dx += 1) {
+        const xx = px + dx;
+        if (xx < 0 || xx >= width) continue;
+        if (strong[rowBase + xx]) { nearStrong = true; break; }
+      }
+    }
+    if (!nearStrong) data[pidx * 4 + 3] = 0;
   }
-  const edgeThreshold = Math.max(2, Math.round(Math.min(width, height) * 0.0015));
-  const tightMinX = colCounts.findIndex((count) => count >= edgeThreshold);
-  const tightMaxX = colCounts.length - 1 - [...colCounts].reverse().findIndex((count) => count >= edgeThreshold);
-  const tightMinY = rowCounts.findIndex((count) => count >= edgeThreshold);
-  const tightMaxY = rowCounts.length - 1 - [...rowCounts].reverse().findIndex((count) => count >= edgeThreshold);
-  if (tightMinX >= 0 && tightMinY >= 0 && tightMaxX >= tightMinX && tightMaxY >= tightMinY) {
-    minX = tightMinX;
-    maxX = tightMaxX;
-    minY = tightMinY;
-    maxY = tightMaxY;
+
+  let minX = width;
+  let minY = height;
+  let maxX = 0;
+  let maxY = 0;
+  for (let pidx = 0; pidx < width * height; pidx += 1) {
+    if (data[pidx * 4 + 3] < 120) continue;
+    const x = pidx % width;
+    const y = Math.floor(pidx / width);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+
+  const densityBox = (alphaThreshold: number, ratio: number) => {
+    const rowCounts = new Array<number>(height).fill(0);
+    const colCounts = new Array<number>(width).fill(0);
+    for (let index = 0; index < data.length; index += 4) {
+      if (data[index + 3] < alphaThreshold) continue;
+      colCounts[(index / 4) % width] += 1;
+      rowCounts[Math.floor(index / 4 / width)] += 1;
+    }
+    let maxRow = 1;
+    let maxCol = 1;
+    for (let i = 0; i < height; i += 1) if (rowCounts[i] > maxRow) maxRow = rowCounts[i];
+    for (let i = 0; i < width; i += 1) if (colCounts[i] > maxCol) maxCol = colCounts[i];
+    const rowT = Math.max(3, maxRow * ratio);
+    const colT = Math.max(3, maxCol * ratio);
+    const firstAbove = (counts: number[], t: number) => counts.findIndex((count) => count >= t);
+    const lastAbove = (counts: number[], t: number) => {
+      for (let i = counts.length - 1; i >= 0; i -= 1) if (counts[i] >= t) return i;
+      return -1;
+    };
+    return {
+      x0: firstAbove(colCounts, colT),
+      x1: lastAbove(colCounts, colT),
+      y0: firstAbove(rowCounts, rowT),
+      y1: lastAbove(rowCounts, rowT),
+    };
+  };
+
+  // 圆形印章：用强像素质心当圆心、距离分布的高分位数当半径——对个别离群杂点（如圆外
+  // 的小污点）稳健，不会被拉大半径。再用圆形蒙版把圆外的一切（盖章水印等）整体抹掉，
+  // 并裁剪到圆的正方形外接框。方形名章（四角有内容）则跳过蒙版，避免裁掉四角。
+  let circleApplied = false;
+  let sumX = 0;
+  let sumY = 0;
+  let strongCount = 0;
+  for (let index = 0; index < data.length; index += 4) {
+    if (data[index + 3] < 120) continue;
+    sumX += (index / 4) % width;
+    sumY += Math.floor(index / 4 / width);
+    strongCount += 1;
+  }
+  if (strongCount >= 50) {
+    const centerX = sumX / strongCount;
+    const centerY = sumY / strongCount;
+    // 距离直方图取分位数作半径，剔除离群杂点。
+    const maxDim = Math.max(width, height);
+    const bins = 256;
+    const hist = new Array<number>(bins).fill(0);
+    for (let index = 0; index < data.length; index += 4) {
+      if (data[index + 3] < 120) continue;
+      const dx = ((index / 4) % width) - centerX;
+      const dy = Math.floor(index / 4 / width) - centerY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const bin = Math.min(bins - 1, Math.floor((dist / maxDim) * bins));
+      hist[bin] += 1;
+    }
+    const target = strongCount * 0.98;
+    let acc = 0;
+    let radius = 0;
+    for (let bin = 0; bin < bins; bin += 1) {
+      acc += hist[bin];
+      if (acc >= target) {
+        radius = ((bin + 1) / bins) * maxDim;
+        break;
+      }
+    }
+    if (radius >= 10) {
+      // 仅检测四个真正的角（|dx|、|dy| 都很大处），区分圆形章与方形名章。
+      let cornerInk = 0;
+      let cornerArea = 0;
+      const cornerLimit = radius * 0.7;
+      const cy0 = Math.max(0, Math.round(centerY - radius));
+      const cy1 = Math.min(height - 1, Math.round(centerY + radius));
+      const cx0 = Math.max(0, Math.round(centerX - radius));
+      const cx1 = Math.min(width - 1, Math.round(centerX + radius));
+      for (let y = cy0; y <= cy1; y += 1) {
+        if (Math.abs(y - centerY) < cornerLimit) continue;
+        for (let x = cx0; x <= cx1; x += 1) {
+          if (Math.abs(x - centerX) < cornerLimit) continue;
+          cornerArea += 1;
+          if (data[(y * width + x) * 4 + 3] >= 120) cornerInk += 1;
+        }
+      }
+      const cornerFraction = cornerArea > 0 ? cornerInk / cornerArea : 1;
+      if (cornerFraction < 0.12) {
+        const maskRadius = radius * 1.03;
+        const maskRadiusSq = maskRadius * maskRadius;
+        for (let index = 0; index < data.length; index += 4) {
+          if (data[index + 3] === 0) continue;
+          const dx = ((index / 4) % width) - centerX;
+          const dy = Math.floor(index / 4 / width) - centerY;
+          if (dx * dx + dy * dy > maskRadiusSq) data[index + 3] = 0;
+        }
+        minX = Math.round(centerX - maskRadius);
+        maxX = Math.round(centerX + maskRadius);
+        minY = Math.round(centerY - maskRadius);
+        maxY = Math.round(centerY + maskRadius);
+        circleApplied = true;
+      }
+    }
+  }
+
+  // 非圆形（方形名章）：用强像素密度框收紧边界。
+  if (!circleApplied) {
+    const dense = densityBox(120, 0.08);
+    if (dense.x0 >= 0 && dense.y0 >= 0 && dense.x1 >= dense.x0 && dense.y1 >= dense.y0) {
+      minX = dense.x0;
+      maxX = dense.x1;
+      minY = dense.y0;
+      maxY = dense.y1;
+    }
   }
 
   sourceContext.putImageData(imageData, 0, 0);
-  const padding = Math.min(10, Math.max(2, Math.round(Math.max(maxX - minX, maxY - minY) * 0.012)));
+  const padding = circleApplied ? 2 : Math.min(8, Math.max(2, Math.round(Math.max(maxX - minX, maxY - minY) * 0.015)));
   minX = Math.max(0, minX - padding);
   minY = Math.max(0, minY - padding);
   maxX = Math.min(width - 1, maxX + padding);
@@ -592,6 +769,194 @@ async function generateSealFromScan(file: File, squareOutput: boolean) {
   const dy = squareOutput ? Math.round((outputSize - cropHeight) / 2) : 0;
   outputContext.drawImage(sourceCanvas, minX, minY, cropWidth, cropHeight, dx, dy, cropWidth, cropHeight);
   return canvasToPngDataUrl(outputCanvas);
+}
+
+function colorDistance(r: number, g: number, b: number, ref: [number, number, number]) {
+  const dr = r - ref[0];
+  const dg = g - ref[1];
+  const db = b - ref[2];
+  return Math.sqrt(dr * dr + dg * dg + db * db);
+}
+
+// 采样图像四周边缘像素，估计实际背景色（取各通道中位数，抗少量墨迹干扰），
+// 并判断边缘是否足够均匀（用于决定是否启用按背景色去底）。
+function estimateBorderBackground(data: Uint8ClampedArray, width: number, height: number) {
+  const samples: Array<[number, number, number]> = [];
+  const pushPixel = (x: number, y: number) => {
+    const i = (y * width + x) * 4;
+    if (data[i + 3] < 20) return;
+    samples.push([data[i], data[i + 1], data[i + 2]]);
+  };
+  const stepX = Math.max(1, Math.floor(width / 80));
+  const stepY = Math.max(1, Math.floor(height / 80));
+  for (let x = 0; x < width; x += stepX) {
+    pushPixel(x, 0);
+    pushPixel(x, height - 1);
+  }
+  for (let y = 0; y < height; y += stepY) {
+    pushPixel(0, y);
+    pushPixel(width - 1, y);
+  }
+  if (!samples.length) return null;
+  const median = (channel: number) => {
+    const sorted = samples.map((sample) => sample[channel]).sort((a, b) => a - b);
+    return sorted[sorted.length >> 1];
+  };
+  const bg: [number, number, number] = [median(0), median(1), median(2)];
+  const within = samples.filter((sample) => colorDistance(sample[0], sample[1], sample[2], bg) <= 60).length;
+  return { bg, uniform: within / samples.length >= 0.62 };
+}
+
+// 自定义印章抠图核心（纯函数，便于单测）：
+// 采样实际背景色（白底/米黄底/任意纯色底均可），用「边缘连通漫水 + 全局相近色」
+// 两步把背景设为透明，保留任意颜色的笔迹/图案，边缘做柔和羽化。返回内容边界框。
+function removeFlatBackground(data: Uint8ClampedArray, width: number, height: number) {
+  const info = estimateBorderBackground(data, width, height);
+  const total = width * height;
+  const borderLuminance = info ? 0.299 * info.bg[0] + 0.587 * info.bg[1] + 0.114 * info.bg[2] : 255;
+  // 边缘不均匀或偏暗时，退回「白底」假设，避免误删主体。
+  const useDetectedBg = Boolean(info && info.uniform && borderLuminance >= 120);
+  const ref: [number, number, number] = useDetectedBg ? info!.bg : [255, 255, 255];
+  const tolMain = useDetectedBg ? 86 : 62;
+  const tolSpeck = useDetectedBg ? 76 : 50;
+  const featherBand = 44;
+
+  const isBackground = new Uint8Array(total);
+  const distAt = (idx: number) => {
+    const i = idx * 4;
+    return colorDistance(data[i], data[i + 1], data[i + 2], ref);
+  };
+  const isTransparent = (idx: number) => data[idx * 4 + 3] < 24;
+
+  // 第一步：从四条边界做漫水，吃掉与背景相连的整片底色。
+  const queue: number[] = [];
+  const enqueue = (idx: number) => {
+    if (isBackground[idx]) return;
+    if (isTransparent(idx) || distAt(idx) <= tolMain) {
+      isBackground[idx] = 1;
+      queue.push(idx);
+    }
+  };
+  for (let x = 0; x < width; x += 1) {
+    enqueue(x);
+    enqueue((height - 1) * width + x);
+  }
+  for (let y = 0; y < height; y += 1) {
+    enqueue(y * width);
+    enqueue(y * width + width - 1);
+  }
+  let head = 0;
+  while (head < queue.length) {
+    const idx = queue[head];
+    head += 1;
+    const x = idx % width;
+    const y = (idx / width) | 0;
+    if (x > 0) enqueue(idx - 1);
+    if (x < width - 1) enqueue(idx + 1);
+    if (y > 0) enqueue(idx - width);
+    if (y < height - 1) enqueue(idx + width);
+  }
+
+  // 第二步：清理被笔迹包围、漫水到不了的背景色小斑点（如纸张纹理网点）。
+  for (let idx = 0; idx < total; idx += 1) {
+    if (isBackground[idx] || isTransparent(idx)) continue;
+    if (distAt(idx) <= tolSpeck) isBackground[idx] = 1;
+  }
+
+  // 第三步：写回 alpha，边缘按与背景的距离做柔和羽化，并统计内容边界框。
+  let minX = width;
+  let minY = height;
+  let maxX = 0;
+  let maxY = 0;
+  let kept = 0;
+  let solid = 0;
+  // 裁剪框只统计「足够实心」的内容像素，忽略边缘半透明羽化像素，避免留白过多。
+  const bboxAlphaThreshold = 40;
+  for (let idx = 0; idx < total; idx += 1) {
+    const i = idx * 4;
+    if (isBackground[idx]) {
+      data[i + 3] = 0;
+      continue;
+    }
+    const dist = distAt(idx);
+    let alpha = data[i + 3];
+    if (dist < tolMain + featherBand) {
+      const t = (dist - tolMain) / featherBand;
+      alpha = Math.min(alpha, clampByte(t * 255));
+    }
+    if (alpha <= 6) {
+      data[i + 3] = 0;
+      continue;
+    }
+    data[i + 3] = alpha;
+    kept += 1;
+    if (alpha < bboxAlphaThreshold) continue;
+    const x = idx % width;
+    const y = (idx / width) | 0;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    solid += 1;
+  }
+
+  if (solid < Math.max(24, total * 0.0001) || kept < Math.max(40, total * 0.0002)) return null;
+  return { minX, minY, maxX, maxY, kept };
+}
+
+// 将一张透明 PNG 顺时针旋转 90°，返回新的 dataUrl 与宽高比（宽高互换）。
+async function rotateDataUrl90(dataUrl: string) {
+  const image = await imageElement(dataUrl);
+  const w = image.naturalWidth;
+  const h = image.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = h;
+  canvas.height = w;
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('无法旋转图片');
+  context.translate(canvas.width / 2, canvas.height / 2);
+  context.rotate(Math.PI / 2);
+  context.drawImage(image, -w / 2, -h / 2);
+  const rotated = await canvasToPngDataUrl(canvas);
+  return { dataUrl: rotated, aspect: canvas.height / canvas.width };
+}
+
+// 自定义印章抠图：自动识别并去掉背景（白底 / 米黄纸底 / 任意纯色底均可），
+// 保留任意颜色（黑、蓝、红等）的笔迹与图案。适用于签名章等。
+// 自动裁剪到内容边界，保留原始宽高比（不强制正方形）。
+async function generateCustomSealFromImage(file: File) {
+  const source = await fileToDataUrl(file);
+  const image = await imageElement(source);
+  const maxSourceSide = 2000;
+  const scale = Math.min(1, maxSourceSide / Math.max(image.naturalWidth, image.naturalHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) throw new Error('无法读取图片');
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const box = removeFlatBackground(imageData.data, canvas.width, canvas.height);
+  if (!box) throw new Error('未识别到清晰的图案');
+
+  context.putImageData(imageData, 0, 0);
+  // 仅留极小边距，避免切到抗锯齿边缘；留白尽量少。
+  const padding = Math.min(3, Math.max(1, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.004)));
+  const minX = Math.max(0, box.minX - padding);
+  const minY = Math.max(0, box.minY - padding);
+  const maxX = Math.min(canvas.width - 1, box.maxX + padding);
+  const maxY = Math.min(canvas.height - 1, box.maxY + padding);
+  const cropWidth = Math.max(1, maxX - minX + 1);
+  const cropHeight = Math.max(1, maxY - minY + 1);
+  const outputCanvas = document.createElement('canvas');
+  outputCanvas.width = cropWidth;
+  outputCanvas.height = cropHeight;
+  const outputContext = outputCanvas.getContext('2d');
+  if (!outputContext) throw new Error('无法生成透明印章');
+  outputContext.drawImage(canvas, minX, minY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+  const dataUrl = await canvasToPngDataUrl(outputCanvas);
+  return { dataUrl, aspect: cropHeight / cropWidth };
 }
 
 // 平铺水印：45° 斜度、20px 宋体、灰色、透明度 20%。
@@ -754,6 +1119,19 @@ function dataUrlToBytes(dataUrl: string) {
 
 function dataUrlMime(dataUrl: string) {
   return dataUrl.match(/^data:([^;,]+)/)?.[1] || 'application/octet-stream';
+}
+
+// 将任意图片 dataUrl 统一转换为 PNG 字节，保证下载的印章都是 PNG（保留透明）。
+async function dataUrlToPngBytes(dataUrl: string) {
+  if (dataUrlMime(dataUrl) === 'image/png') return dataUrlToBytes(dataUrl);
+  const image = await imageElement(dataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, image.naturalWidth);
+  canvas.height = Math.max(1, image.naturalHeight);
+  const context = canvas.getContext('2d');
+  if (!context) return dataUrlToBytes(dataUrl);
+  context.drawImage(image, 0, 0);
+  return dataUrlToBytes(await canvasToPngDataUrl(canvas));
 }
 
 function bytesToDataUrl(bytes: Uint8Array, mimeType: string) {
@@ -983,8 +1361,12 @@ function samePages(left: number[], right: number[]) {
   return left.every((page, index) => page === right[index]);
 }
 
-function actionTitle(action: StampAction) {
-  return action.type === 'seam' ? '骑缝章' : sealLabels[action.sealKind];
+function actionTitle(action: StampAction, subject?: Subject) {
+  if (action.type === 'seam') return '骑缝章';
+  if (action.customSealId) {
+    return findCustomSeal(subject, action.customSealId)?.name || '自定义印章';
+  }
+  return sealLabels[action.sealKind];
 }
 
 function dedupeSeamActions(list: StampAction[]) {
@@ -1233,6 +1615,7 @@ function SealUpload({
   onChange,
   onSizeChange,
   onDelete,
+  onDownload,
   onGenerated,
 }: {
   kind: SealKind;
@@ -1242,6 +1625,7 @@ function SealUpload({
   onChange: (dataUrl: string) => void;
   onSizeChange: (mm: number) => void;
   onDelete: () => void;
+  onDownload: () => void;
   onGenerated: (message: string) => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1325,6 +1709,12 @@ function SealUpload({
         <span className="seal-card-name">{label}</span>
         <span className={`seal-badge ${value ? 'on' : 'off'}`}>{value ? '已上传' : '未上传'}</span>
         {value && (
+          <button className="seal-card-download" type="button" title="下载该印章 PNG" onClick={onDownload}>
+            <Download size={13} />
+            下载
+          </button>
+        )}
+        {value && (
           <button className="seal-card-delete" type="button" title="删除印章" onClick={onDelete}>
             <Trash2 size={14} />
           </button>
@@ -1402,6 +1792,124 @@ function SealUpload({
           const file = event.target.files?.[0];
           event.target.value = '';
           if (file) await handleSealFile(file);
+        }}
+      />
+    </div>
+  );
+}
+
+function CustomSealCard({
+  seal,
+  onRename,
+  onWidthChange,
+  onReplace,
+  onRotate,
+  onDownload,
+  onDelete,
+}: {
+  seal: CustomSeal;
+  onRename: (name: string) => void;
+  onWidthChange: (widthMm: number) => void;
+  onReplace: (file: File) => void;
+  onRotate: () => void;
+  onDownload: () => void;
+  onDelete: () => void;
+}) {
+  const replaceRef = useRef<HTMLInputElement | null>(null);
+  const [nameDraft, setNameDraft] = useState(seal.name);
+  const [widthDraft, setWidthDraft] = useState(String(seal.widthMm));
+
+  useEffect(() => {
+    setNameDraft(seal.name);
+  }, [seal.name]);
+  useEffect(() => {
+    setWidthDraft(String(seal.widthMm));
+  }, [seal.widthMm]);
+
+  function commitName() {
+    const next = nameDraft.trim() || seal.name;
+    setNameDraft(next);
+    if (next !== seal.name) onRename(next);
+  }
+
+  function commitWidth() {
+    const next = clampCustomSealMm(Number(widthDraft));
+    setWidthDraft(String(next));
+    if (next !== seal.widthMm) onWidthChange(next);
+  }
+
+  function stepWidth(delta: number) {
+    const base = Number(widthDraft);
+    const current = Number.isFinite(base) ? base : seal.widthMm;
+    const next = clampCustomSealMm(current + delta);
+    setWidthDraft(String(next));
+    if (next !== seal.widthMm) onWidthChange(next);
+  }
+
+  return (
+    <div className="custom-seal-card">
+      <div className="custom-seal-thumb-wrap">
+        <button
+          type="button"
+          className="custom-seal-thumb"
+          onClick={() => replaceRef.current?.click()}
+          title="点击替换图片"
+        >
+          <img src={seal.dataUrl} alt={seal.name} />
+        </button>
+        <button
+          type="button"
+          className="custom-seal-rotate"
+          title="旋转 90°"
+          aria-label="旋转 90°"
+          onClick={onRotate}
+        >
+          <RotateCw size={13} />
+        </button>
+      </div>
+      <div className="custom-seal-meta">
+        <input
+          className="custom-seal-name"
+          value={nameDraft}
+          onChange={(event) => setNameDraft(event.target.value)}
+          onBlur={commitName}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') (event.target as HTMLInputElement).blur();
+          }}
+          placeholder="印章名称"
+        />
+        <div className="custom-seal-width">
+          <button type="button" className="custom-seal-step" title="调小" aria-label="调小" onClick={() => stepWidth(-1)}>−</button>
+          <input
+            type="number"
+            min={MIN_SEAL_MM}
+            max={MAX_SEAL_MM}
+            value={widthDraft}
+            onChange={(event) => setWidthDraft(event.target.value)}
+            onBlur={commitWidth}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') (event.target as HTMLInputElement).blur();
+            }}
+          />
+          <button type="button" className="custom-seal-step" title="调大" aria-label="调大" onClick={() => stepWidth(1)}>+</button>
+        </div>
+      </div>
+      <div className="custom-seal-actions">
+        <button className="custom-seal-iconbtn" type="button" title="下载该印章 PNG" onClick={onDownload}>
+          <Download size={14} />
+        </button>
+        <button className="custom-seal-iconbtn danger" type="button" title="删除自定义印章" onClick={onDelete}>
+          <Trash2 size={14} />
+        </button>
+      </div>
+      <input
+        ref={replaceRef}
+        type="file"
+        accept="image/png,image/jpeg"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = '';
+          if (file) onReplace(file);
         }}
       />
     </div>
@@ -1495,16 +2003,20 @@ function App() {
   const [batchEnd, setBatchEnd] = useState(1);
   const [specificPages, setSpecificPages] = useState('1');
   const [selectedSealKind, setSelectedSealKind] = useState<SealKind>('official');
-  const [manageSealKind, setManageSealKind] = useState<SealKind>('official');
-  const [isSealDropActive, setIsSealDropActive] = useState(false);
+  const [selectedCustomSealId, setSelectedCustomSealId] = useState<string | null>(null);
+  const [isCustomSealDropActive, setIsCustomSealDropActive] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [isAddingCustomSeal, setIsAddingCustomSeal] = useState(false);
+  const [resizingActionId, setResizingActionId] = useState<string | null>(null);
+  const customSealInputRef = useRef<HTMLInputElement | null>(null);
+  const resizeSnapshotRef = useRef<StampAction[] | null>(null);
+  const didAutoCollapseRef = useRef(false);
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [xPercent, setXPercent] = useState(72);
   const [yPercent, setYPercent] = useState(74);
   const [pagePositionOverrides, setPagePositionOverrides] = useState<Record<number, PagePositionOverride>>({});
-  const [overridePage, setOverridePage] = useState(1);
-  const [overrideXPercent, setOverrideXPercent] = useState(72);
-  const [overrideYPercent, setOverrideYPercent] = useState(74);
-  const [overrideDraftTouched, setOverrideDraftTouched] = useState(false);
-  const [positionTarget, setPositionTarget] = useState<'default' | 'page'>('default');
+  const [movingActionId, setMovingActionId] = useState<string | null>(null);
+  const moveSnapshotRef = useRef<StampAction[] | null>(null);
   const [sizePercent, setSizePercent] = useState(17);
   const [seamStart, setSeamStart] = useState(1);
   const [seamEnd, setSeamEnd] = useState(4);
@@ -1517,7 +2029,6 @@ function App() {
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const qualificationInputRef = useRef<HTMLInputElement | null>(null);
-  const sealDropInputRef = useRef<HTMLInputElement | null>(null);
   const materialImportInputRef = useRef<HTMLInputElement | null>(null);
   const documentStageRef = useRef<HTMLElement | null>(null);
   const pageWrapRef = useRef<HTMLDivElement | null>(null);
@@ -1532,11 +2043,31 @@ function App() {
   );
 
   useEffect(() => {
-    const remembered = readRememberedLogin();
-    if (!remembered) return;
-    setLoginName(remembered.username || LOGIN_USERNAME);
-    setRememberLogin(true);
-    setIsAuthenticated(true);
+    let isCancelled = false;
+
+    async function hydrateLoginSettings() {
+      let nextCredentials = DEFAULT_LOGIN_CREDENTIALS;
+      try {
+        const persisted = await readPersistedAppData();
+        nextCredentials = persisted?.loginCredentials || DEFAULT_LOGIN_CREDENTIALS;
+      } catch {
+        nextCredentials = DEFAULT_LOGIN_CREDENTIALS;
+      }
+      if (isCancelled) return;
+      setLoginCredentials(nextCredentials);
+      setLoginUsernameDraft(nextCredentials.username);
+      setLoginPasswordDraft(nextCredentials.password);
+      const remembered = readRememberedLogin(nextCredentials);
+      if (!remembered) return;
+      setLoginName(remembered.username || nextCredentials.username);
+      setRememberLogin(true);
+      setIsAuthenticated(true);
+    }
+
+    hydrateLoginSettings();
+    return () => {
+      isCancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -1633,6 +2164,11 @@ function App() {
         setRecords(persisted?.records || []);
         setExportName(persisted?.exportName || '已盖章文件_已电子签章.pdf');
         setColorTheme(persisted?.colorTheme || 'red');
+        setSidebarCollapsed(Boolean(persisted?.sidebarCollapsed));
+        if (persisted?.sidebarCollapsed) didAutoCollapseRef.current = true;
+        setLoginCredentials(persisted?.loginCredentials || DEFAULT_LOGIN_CREDENTIALS);
+        setLoginUsernameDraft((persisted?.loginCredentials || DEFAULT_LOGIN_CREDENTIALS).username);
+        setLoginPasswordDraft((persisted?.loginCredentials || DEFAULT_LOGIN_CREDENTIALS).password);
         setStorageInfo(nextStorageInfo);
         setEditingActionId(null);
         setIsDatabaseReady(true);
@@ -1665,16 +2201,40 @@ function App() {
     document.documentElement.dataset.theme = colorTheme;
   }, [colorTheme]);
 
+  // 上传好印章并打开 PDF 进入盖章后，首次自动收起左侧菜单（每会话仅一次，手动展开后不再自动收起）。
+  useEffect(() => {
+    if (didAutoCollapseRef.current || sidebarCollapsed || !pdfDocument) return;
+    const hasSeals = Boolean(activeSubject)
+      && (Object.keys(activeSubject!.seals).length > 0 || (activeSubject!.customSeals?.length || 0) > 0);
+    if (!hasSeals) return;
+    didAutoCollapseRef.current = true;
+    setSidebarCollapsed(true);
+    setStatus('已自动收起左侧菜单，专注盖章。点 logo 旁的按钮可随时展开。');
+  }, [pdfDocument, activeSubject, sidebarCollapsed]);
+
   useEffect(() => {
     if (!isAuthenticated || !isDatabaseReady) return;
     if (!activeSubjectId && subjects[0]) {
       setActiveSubjectId(subjects[0].id);
       return;
     }
-    writePersistedAppData({ subjects, activeSubjectId, actions, exportName, records, colorTheme }).catch(() => {
-      setStatus('应用数据写入失败，部分大文件可能仅在本次页面会话中可用。');
-    });
-  }, [isAuthenticated, isDatabaseReady, subjects, activeSubjectId, actions, exportName, records, colorTheme]);
+    // 防抖：状态频繁变化（如输入文件名、拖动）时合并写入，避免每次都把含大量
+    // base64 的完整工作区写盘，减少磁盘抖动与卡顿。
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    const snapshot = { subjects, activeSubjectId, actions, exportName, records, colorTheme, loginCredentials, sidebarCollapsed };
+    persistTimerRef.current = setTimeout(() => {
+      persistTimerRef.current = null;
+      writePersistedAppData(snapshot).catch(() => {
+        setStatus('应用数据写入失败，部分大文件可能仅在本次页面会话中可用。');
+      });
+    }, 400);
+    return () => {
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+    };
+  }, [isAuthenticated, isDatabaseReady, subjects, activeSubjectId, actions, exportName, records, colorTheme, loginCredentials, sidebarCollapsed]);
 
   useEffect(() => {
     setBatchEnd(pageCount || 1);
@@ -1682,24 +2242,8 @@ function App() {
     setSeamEnd(pageCount || 1);
     setSplitCount(defaultSeamSplitCount(pageCount));
     setSpecificPages(pageCount ? '1' : '');
-    setOverridePage(1);
     setPagePositionOverrides({});
-    setOverrideDraftTouched(false);
-    setPositionTarget('default');
   }, [pageCount]);
-
-  useEffect(() => {
-    const minPage = Math.min(batchStart, batchEnd);
-    const maxPage = Math.max(batchStart, batchEnd);
-    setOverridePage((page) => clampPercent(page, minPage || 1, maxPage || pageCount || 1));
-  }, [batchStart, batchEnd, pageCount]);
-
-  useEffect(() => {
-    const savedOverride = pagePositionOverrides[overridePage];
-    setOverrideXPercent(savedOverride?.xPercent ?? xPercent);
-    setOverrideYPercent(savedOverride?.yPercent ?? yPercent);
-    setOverrideDraftTouched(false);
-  }, [overridePage, pagePositionOverrides, xPercent, yPercent]);
 
   useEffect(() => {
     const normalized = dedupeSeamActions(actions);
@@ -1736,21 +2280,22 @@ function App() {
   );
   const canUndoActions = undoStack.length > 0;
   const canRedoActions = redoStack.length > 0;
-  const isEditingBatchAction = Boolean(editingActionId && mode === 'batch');
   const batchDraftPages = useMemo(
     () => (mode === 'batch' ? rangePages(batchStart, batchEnd, pageCount) : []),
     [mode, batchStart, batchEnd, pageCount],
   );
   const isCurrentPageInBatchDraft = mode !== 'batch' || batchDraftPages.includes(currentPage);
 
+  const selectedCustomSeal = mode !== 'seam' ? findCustomSeal(activeSubject, selectedCustomSealId || undefined) : undefined;
+  const draftIsCustom = Boolean(selectedCustomSeal);
   const currentSealSizePercent = sealSizePercent(selectedSealKind, sizePercent, activeSubject?.sealSizes);
-  const draftSealSrc = mode !== 'seam' ? activeSubject?.seals[selectedSealKind] : undefined;
-  const savedDraftPageOverride = mode === 'batch' ? pagePositionOverrides[currentPage] : undefined;
-  const pendingDraftPageOverride = mode === 'batch' && positionTarget === 'page' && currentPage === overridePage && overrideDraftTouched
-    ? { xPercent: overrideXPercent, yPercent: overrideYPercent }
+  const draftWidthPercent = selectedCustomSeal ? mmToWidthPercent(selectedCustomSeal.widthMm) : currentSealSizePercent;
+  const draftAspect = selectedCustomSeal ? selectedCustomSeal.aspect : 1;
+  const draftSealSrc = mode !== 'seam'
+    ? (selectedCustomSeal ? selectedCustomSeal.dataUrl : activeSubject?.seals[selectedSealKind])
     : undefined;
-  const effectiveDraftXPercent = pendingDraftPageOverride?.xPercent ?? savedDraftPageOverride?.xPercent ?? xPercent;
-  const effectiveDraftYPercent = pendingDraftPageOverride?.yPercent ?? savedDraftPageOverride?.yPercent ?? yPercent;
+  const effectiveDraftXPercent = xPercent;
+  const effectiveDraftYPercent = yPercent;
   const draftSeamPages = mode === 'seam'
     ? rangePages(seamStart, seamEnd, pageCount)
     : [];
@@ -1761,24 +2306,31 @@ function App() {
   const shouldShowDraftSeam = mode === 'seam' && Boolean(activeSubject?.seals.official) && draftSeamPageIndex >= 0;
   const draftSeamHeight = (renderPage.width * sealSizePercent('official', seamHeight, activeSubject?.sealSizes)) / 100;
   const draftSeamWidth = Math.max(12, draftSeamHeight / Math.max(1, draftSeamSlice?.groupSize || splitCount));
-  const canPositionOnPage = mode === 'seam' ? shouldShowDraftSeam : Boolean(draftSealSrc && isCurrentPageInBatchDraft);
-  const isDraftDuplicate = mode !== 'seam' && currentActions.some((action) => (
+  const isDraftDuplicate = mode !== 'seam' && !draftIsCustom && currentActions.some((action) => (
     (() => {
-      if (action.type !== 'normal' || action.id === editingActionId || action.sealKind !== selectedSealKind) return false;
+      if (action.type !== 'normal' || action.id === editingActionId || action.customSealId || action.sealKind !== selectedSealKind) return false;
       const position = pagePosition(action, currentPage);
       return position.xPercent === effectiveDraftXPercent
         && position.yPercent === effectiveDraftYPercent
         && Math.abs(sealSizePercent(action.sealKind, action.sizePercent, activeSubject?.sealSizes) - currentSealSizePercent) < 0.01;
     })()
   ));
-  const shouldShowDraftStamp = Boolean(draftSealSrc && isCurrentPageInBatchDraft && !isDraftDuplicate);
+  // 批量模式下，本页若已盖有所选印章（即批量章已添加），就不再显示草稿预览，也不再
+  // 让空白点击改默认位置——否则逐页拖动后默认位置会冒出多余的草稿幽灵。指定页模式可
+  // 重复添加，不抑制。
+  const currentPageHasSelectedSeal = mode === 'batch' && currentActions.some((action) =>
+    action.type === 'normal'
+    && action.id !== editingActionId
+    && (draftIsCustom
+      ? action.customSealId === (selectedCustomSealId || undefined)
+      : (!action.customSealId && action.sealKind === selectedSealKind)));
+  const canPositionOnPage = mode === 'seam'
+    ? shouldShowDraftSeam
+    : Boolean(draftSealSrc && isCurrentPageInBatchDraft && !currentPageHasSelectedSeal);
+  const shouldShowDraftStamp = Boolean(
+    draftSealSrc && isCurrentPageInBatchDraft && !isDraftDuplicate && !currentPageHasSelectedSeal,
+  );
 
-  useEffect(() => {
-    if (!isEditingBatchAction || !pageCount) return;
-    if (!batchDraftPages.includes(currentPage)) return;
-    setOverridePage(currentPage);
-    setPositionTarget('page');
-  }, [isEditingBatchAction, currentPage, pageCount, batchDraftPages]);
 
   async function loadPdfWorkspace(options: {
     bytes: Uint8Array;
@@ -1798,9 +2350,6 @@ function App() {
     resetActionHistory(options.actions || []);
     setEditingActionId(null);
     setPagePositionOverrides({});
-    setOverridePage(1);
-    setOverrideDraftTouched(false);
-    setPositionTarget('default');
     setExportName(options.exportName || defaultExportName(options.name));
     setFitWidth(true);
     setZoom(1);
@@ -1917,22 +2466,160 @@ function App() {
     setStatus(`已删除${sealLabels[kind]}。`);
   }
 
-  async function importSealForKind(kind: SealKind, file: File) {
+  function updateSubjectCustomSeals(subjectId: string, updater: (items: CustomSeal[]) => CustomSeal[]) {
+    setSubjects((list) =>
+      list.map((subject) =>
+        subject.id === subjectId
+          ? { ...subject, customSeals: updater(subject.customSeals || []) }
+          : subject,
+      ),
+    );
+  }
+
+  async function addCustomSeal(file: File) {
     if (!activeSubject) {
       setStatus('请先添加并选择主体。');
       return;
     }
+    setIsAddingCustomSeal(true);
     try {
-      const generated = await generateSealFromScan(file, true);
-      updateSubjectSeal(activeSubject.id, kind, generated);
-      setStatus(`已生成并裁剪${sealLabels[kind]}透明 PNG，可直接用于盖章。`);
+      let dataUrl: string;
+      let aspect = 1;
+      let message = '已添加自定义印章并自动去白底，可直接用于盖章。';
+      try {
+        const generated = await generateCustomSealFromImage(file);
+        dataUrl = generated.dataUrl;
+        aspect = generated.aspect;
+      } catch (error) {
+        dataUrl = await fileToDataUrl(file);
+        const image = await imageElement(dataUrl).catch(() => null);
+        if (image && image.naturalWidth) aspect = image.naturalHeight / image.naturalWidth;
+        message = error instanceof Error
+          ? `${error.message}，已先保留原图。建议使用白底、清晰的扫描件。`
+          : '未能自动去底，已先保留原图。';
+      }
+      const existingCount = activeSubject.customSeals?.length || 0;
+      const newSeal: CustomSeal = {
+        id: uid('custom'),
+        name: `自定义印章${existingCount + 1}`,
+        dataUrl,
+        widthMm: DEFAULT_CUSTOM_SEAL_MM,
+        aspect: aspect > 0 ? aspect : 1,
+      };
+      updateSubjectCustomSeals(activeSubject.id, (items) => [...items, newSeal]);
+      setStatus(message);
+    } finally {
+      setIsAddingCustomSeal(false);
+    }
+  }
+
+  function updateCustomSeal(sealId: string, patch: Partial<Pick<CustomSeal, 'name' | 'widthMm'>>) {
+    if (!activeSubject) return;
+    updateSubjectCustomSeals(activeSubject.id, (items) =>
+      items.map((item) => (item.id === sealId ? { ...item, ...patch } : item)),
+    );
+  }
+
+  async function replaceCustomSealImage(sealId: string, file: File) {
+    if (!activeSubject) return;
+    try {
+      const generated = await generateCustomSealFromImage(file);
+      updateSubjectCustomSeals(activeSubject.id, (items) =>
+        items.map((item) => (item.id === sealId ? { ...item, dataUrl: generated.dataUrl, aspect: generated.aspect > 0 ? generated.aspect : 1 } : item)),
+      );
+      setStatus('已替换自定义印章图片并重新去白底。');
     } catch (error) {
       const fallback = await fileToDataUrl(file);
-      updateSubjectSeal(activeSubject.id, kind, fallback);
-      setStatus(error instanceof Error
-        ? `${error.message}，已先保留原图。建议使用白底、红色清晰的扫描件。`
-        : '未能自动生成透明印章，已先保留原图。');
+      const image = await imageElement(fallback).catch(() => null);
+      const aspect = image && image.naturalWidth ? image.naturalHeight / image.naturalWidth : 1;
+      updateSubjectCustomSeals(activeSubject.id, (items) =>
+        items.map((item) => (item.id === sealId ? { ...item, dataUrl: fallback, aspect: aspect > 0 ? aspect : 1 } : item)),
+      );
+      setStatus(error instanceof Error ? `${error.message}，已先保留原图。` : '未能自动去底，已先保留原图。');
     }
+  }
+
+  async function downloadSingleSeal(name: string, dataUrl: string) {
+    try {
+      const bytes = await dataUrlToPngBytes(dataUrl);
+      const fileName = `${sanitizeFileSegment(name, '印章')}.png`;
+      downloadBlob(new Blob([bytes.slice()], { type: 'image/png' }), fileName);
+      setStatus(`已下载印章：${fileName}`);
+    } catch {
+      setStatus('下载印章失败，请重试。');
+    }
+  }
+
+  async function downloadSubjectSealsZip() {
+    if (!activeSubject) {
+      setStatus('请先选择主体。');
+      return;
+    }
+    try {
+      const entries: ZipFileEntry[] = [];
+      const usedPaths = new Set<string>();
+      for (const kind of sealKindList) {
+        const dataUrl = activeSubject.seals[kind];
+        if (!dataUrl) continue;
+        const path = uniquePath(`${sealLabels[kind]}.png`, usedPaths);
+        entries.push({ path, data: await dataUrlToPngBytes(dataUrl) });
+      }
+      for (const seal of activeSubject.customSeals || []) {
+        const path = uniquePath(`${sanitizeFileSegment(seal.name, '自定义印章')}.png`, usedPaths);
+        entries.push({ path, data: await dataUrlToPngBytes(seal.dataUrl) });
+      }
+      if (!entries.length) {
+        setStatus('当前主体还没有上传任何印章。');
+        return;
+      }
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const zipName = `${sanitizeFileSegment(activeSubject.name, '主体')}_印章_${today}.zip`;
+      downloadBlob(new Blob([createZip(entries)], { type: 'application/zip' }), zipName);
+      setStatus(`已打包下载「${activeSubject.name}」的 ${entries.length} 枚印章（PNG）。`);
+    } catch {
+      setStatus('打包下载失败，请重试。');
+    }
+  }
+
+  async function rotateCustomSeal(sealId: string) {
+    if (!activeSubject) return;
+    const target = activeSubject.customSeals?.find((item) => item.id === sealId);
+    if (!target) return;
+    try {
+      const rotated = await rotateDataUrl90(target.dataUrl);
+      updateSubjectCustomSeals(activeSubject.id, (items) =>
+        items.map((item) => (item.id === sealId ? { ...item, dataUrl: rotated.dataUrl, aspect: rotated.aspect > 0 ? rotated.aspect : 1 } : item)),
+      );
+      // 旋转后，已使用该印章的盖章动作需同步新的宽高比，避免变形。
+      commitActions((list) => list.map((action) => (
+        action.type === 'normal' && action.customSealId === sealId
+          ? { ...action, customAspect: rotated.aspect > 0 ? rotated.aspect : 1 }
+          : action
+      )));
+      setStatus(`已将自定义印章“${target.name}”旋转 90°。`);
+    } catch {
+      setStatus('旋转印章失败，请重试。');
+    }
+  }
+
+  async function deleteCustomSeal(sealId: string) {
+    if (!activeSubject) return;
+    const target = activeSubject.customSeals?.find((item) => item.id === sealId);
+    if (!target) return;
+    const confirmed = await requestConfirm({
+      title: `删除${target.name}`,
+      message: `确定删除自定义印章“${target.name}”？已使用该印章的盖章操作也会一并移除。`,
+      confirmText: '删除',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
+    updateSubjectCustomSeals(activeSubject.id, (items) => items.filter((item) => item.id !== sealId));
+    commitActions((list) => list.filter((action) => !(action.type === 'normal' && action.customSealId === sealId)));
+    if (selectedCustomSealId === sealId) {
+      setSelectedCustomSealId(null);
+      setSelectedSealKind('official');
+    }
+    setStatus(`已删除自定义印章：${target.name}`);
   }
 
   function updateSubjectQualifications(subjectId: string, updater: (items: Qualification[]) => Qualification[]) {
@@ -1962,6 +2649,31 @@ function App() {
     };
     updateSubjectQualifications(activeSubject.id, (items) => [nextQualification, ...items]);
     setStatus(`已添加主体资质：${file.name}`);
+  }
+
+  async function addQualificationFiles(files: File[]) {
+    if (!activeSubject) {
+      setStatus('请先添加主体。');
+      return;
+    }
+    if (!files.length) return;
+    const created: Qualification[] = [];
+    for (const file of files) {
+      const dataUrl = await fileToDataUrl(file);
+      created.push({
+        id: uid('qualification'),
+        name: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        dataUrl,
+        purpose: '',
+        addSeal: true,
+        addWatermark: true,
+      });
+    }
+    updateSubjectQualifications(activeSubject.id, (items) => [...created, ...items]);
+    setStatus(created.length > 1
+      ? `已批量添加 ${created.length} 份主体资质。`
+      : `已添加主体资质：${created[0].name}`);
   }
 
   function updateQualification(qualificationId: string, patch: Partial<Qualification>) {
@@ -2037,6 +2749,48 @@ function App() {
     setDraftName('');
   }
 
+  function togglePinSubject(subjectId: string) {
+    const target = subjects.find((subject) => subject.id === subjectId);
+    if (!target) return;
+    if (!target.pinned && subjects.filter((subject) => subject.pinned).length >= MAX_PINNED_SUBJECTS) {
+      setStatus(`最多置顶 ${MAX_PINNED_SUBJECTS} 个主体，请先取消一个再置顶。`);
+      return;
+    }
+    setSubjects((list) => list.map((subject) => (
+      subject.id === subjectId ? { ...subject, pinned: !subject.pinned } : subject
+    )));
+    setStatus(target.pinned ? `已取消置顶：${target.name}` : `已置顶：${target.name}`);
+  }
+
+  function renderSubjectRow(subject: Subject) {
+    const isActive = subject.id === activeSubject?.id;
+    return (
+      <div
+        className={`subject-row ${isActive ? 'active' : ''}`}
+        key={subject.id}
+        onClick={() => setActiveSubjectId(subject.id)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') setActiveSubjectId(subject.id);
+        }}
+        role="button"
+        tabIndex={0}
+      >
+        <span>{subject.name}</span>
+        <small>{Object.keys(subject.seals).length}/{sealKindList.length}</small>
+        <button
+          className={`subject-pin-button ${subject.pinned ? 'active' : ''}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            togglePinSubject(subject.id);
+          }}
+          title={subject.pinned ? '取消置顶' : '置顶常用主体'}
+        >
+          {subject.pinned ? <PinOff size={13} /> : <Pin size={13} />}
+        </button>
+      </div>
+    );
+  }
+
   async function deleteSubject(subjectId: string) {
     const target = subjects.find((subject) => subject.id === subjectId);
     if (!target) return;
@@ -2092,17 +2846,12 @@ function App() {
     setCurrentPage(action.pages[0] || 1);
     if (action.type === 'normal') {
       setSelectedSealKind(action.sealKind);
+      setSelectedCustomSealId(action.customSealId || null);
       setXPercent(action.xPercent);
       setYPercent(action.yPercent);
       setSizePercent(action.sizePercent);
       setSpecificPages(pagesToRangeText(action.pages));
       setPagePositionOverrides(action.pageOverrides || {});
-      setOverridePage(action.pages[0] || 1);
-      const firstOverride = action.pageOverrides?.[action.pages[0] || 1];
-      setOverrideXPercent(firstOverride?.xPercent ?? action.xPercent);
-      setOverrideYPercent(firstOverride?.yPercent ?? action.yPercent);
-      setOverrideDraftTouched(false);
-      setPositionTarget('default');
       if (areContinuousPages(action.pages)) {
         setMode('batch');
         setBatchStart(action.pages[0]);
@@ -2110,13 +2859,11 @@ function App() {
       } else {
         setMode('specific');
       }
-      setStatus(`正在调整第 ${pagesToRangeText(action.pages)} 页${sealLabels[action.sealKind]}。`);
+      setStatus(`正在调整第 ${pagesToRangeText(action.pages)} 页${actionTitle(action, activeSubject)}。`);
       return;
     }
     setMode('seam');
     setPagePositionOverrides({});
-    setOverrideDraftTouched(false);
-    setPositionTarget('default');
     setSeamStart(action.pages[0] || 1);
     setSeamEnd(action.pages[action.pages.length - 1] || 1);
     setSplitCount(action.splitCount);
@@ -2132,8 +2879,6 @@ function App() {
     setIsPositioningStamp(false);
     if (nextMode === 'seam') {
       setPagePositionOverrides({});
-      setOverrideDraftTouched(false);
-      setPositionTarget('default');
       setSeamStart(1);
       setSeamEnd(pageCount || 1);
       setSplitCount(defaultSeamSplitCount(pageCount));
@@ -2144,15 +2889,11 @@ function App() {
     }
     if (nextMode === 'specific') {
       setPagePositionOverrides({});
-      setOverrideDraftTouched(false);
-      setPositionTarget('default');
       setSpecificPages(pageCount ? String(currentPage) : '');
       setStatus(pageCount ? `已切换到指定页盖章，默认第 ${currentPage} 页。` : '已切换到指定页盖章。');
       return;
     }
-    setOverridePage(currentPage || 1);
-    setPositionTarget('default');
-    setStatus('已切换到批量盖章，可为某一页单独设置印章位置。');
+    setStatus('已切换到批量盖章：所有页同一位置；要单独调整某页，直接在该页拖动印章即可。');
   }
 
   function updateSeamPositionFromPointer(event: React.PointerEvent<HTMLDivElement>) {
@@ -2189,18 +2930,8 @@ function App() {
     if (mode === 'seam' || !draftSealSrc) return;
     const position = normalPositionFromClientPoint(clientX, clientY);
     if (!position) return;
-    const nextX = position.xPercent;
-    const nextY = position.yPercent;
-    if (mode === 'batch' && (positionTarget === 'page' || isEditingBatchAction)) {
-      setOverridePage(currentPage || 1);
-      setOverrideXPercent(nextX);
-      setOverrideYPercent(nextY);
-      setOverrideDraftTouched(true);
-      setPositionTarget('page');
-      return;
-    }
-    setXPercent(nextX);
-    setYPercent(nextY);
+    setXPercent(position.xPercent);
+    setYPercent(position.yPercent);
   }
 
   function updatePagePositionFromPointer(event: React.PointerEvent<HTMLDivElement>) {
@@ -2217,88 +2948,113 @@ function App() {
     updatePagePositionFromPointer(event);
     setIsPositioningStamp(true);
     setStatus(mode === 'seam'
-      ? '已更新骑缝章位置，确认后添加或保存。'
-      : mode === 'batch' && (positionTarget === 'page' || isEditingBatchAction)
-        ? `已调整第 ${currentPage} 页印章位置，保存调整后生效。`
-        : '已更新印章位置，确认后添加或保存。');
+      ? '已更新骑缝章位置，确认后添加。'
+      : '已更新印章位置，确认后添加。');
   }
 
-  function startExistingStampPositioning(event: React.PointerEvent<HTMLImageElement>, action: NormalStamp) {
+  // 直接拖动「已盖在某页上的印章」——只调整这一页的位置（写入该动作的 pageOverrides），
+  // 松手即生效、入历史；不进入编辑态、不会重复新增批量章。
+  function startExistingStampPositioning(event: React.PointerEvent<Element>, action: NormalStamp) {
     if (event.button !== 0 || !action.pages.includes(currentPage)) return;
     event.preventDefault();
     event.stopPropagation();
-    const pointerPosition = normalPositionFromClientPoint(event.clientX, event.clientY);
     const pageElement = pageWrapRef.current;
-    if (!pointerPosition || !pageElement) return;
+    if (!pageElement) return;
     try {
       pageElement.setPointerCapture(event.pointerId);
     } catch {
-      // Pointer capture is best-effort; the initial drag still enters edit mode.
+      // 指针捕获尽力而为，失败也不影响拖拽。
     }
-    setEditingActionId(action.id);
-    setSelectedSealKind(action.sealKind);
-    setXPercent(action.xPercent);
-    setYPercent(action.yPercent);
-    setSizePercent(action.sizePercent);
-    setSpecificPages(pagesToRangeText(action.pages));
-    setPagePositionOverrides(action.pageOverrides || {});
-    if (areContinuousPages(action.pages)) {
-      setMode('batch');
-      setBatchStart(action.pages[0]);
-      setBatchEnd(action.pages[action.pages.length - 1]);
-      setOverridePage(currentPage);
-      setOverrideXPercent(pointerPosition.xPercent);
-      setOverrideYPercent(pointerPosition.yPercent);
-      setOverrideDraftTouched(true);
-      setPositionTarget('page');
-      setStatus(`正在调整第 ${currentPage} 页${sealLabels[action.sealKind]}，保存调整后生效。`);
-    } else {
-      setMode('specific');
-      setXPercent(pointerPosition.xPercent);
-      setYPercent(pointerPosition.yPercent);
-      setStatus(`正在调整第 ${pagesToRangeText(action.pages)} 页${sealLabels[action.sealKind]}。`);
-    }
-    setIsPositioningStamp(true);
+    moveSnapshotRef.current = cloneStampActions(actionsRef.current);
+    setMovingActionId(action.id);
+    setStatus(`正在拖动调整第 ${currentPage} 页${actionTitle(action, activeSubject)}的位置，松手即生效。`);
+    updateStampMoveFromClientPoint(action.id, event.clientX, event.clientY);
   }
 
-  function savePagePositionOverride() {
-    const minPage = Math.min(batchStart, batchEnd);
-    const maxPage = Math.max(batchStart, batchEnd);
-    const pageNumber = clampPercent(overridePage, minPage || 1, maxPage || pageCount || 1);
-    setPagePositionOverrides((list) => ({
-      ...list,
-      [pageNumber]: {
-        xPercent: clampPercent(overrideXPercent),
-        yPercent: clampPercent(overrideYPercent),
-      },
-    }));
-    setCurrentPage(pageNumber);
-    setPositionTarget('page');
-    setOverrideDraftTouched(false);
-    setStatus(`已为第 ${pageNumber} 页保存单独印章位置。`);
+  function updateStampMoveFromClientPoint(actionId: string, clientX: number, clientY: number) {
+    const position = normalPositionFromClientPoint(clientX, clientY);
+    if (!position) return;
+    const next = actionsRef.current.map((item) => {
+      if (item.id !== actionId || item.type !== 'normal') return item;
+      return {
+        ...item,
+        pageOverrides: { ...item.pageOverrides, [currentPage]: { xPercent: position.xPercent, yPercent: position.yPercent } },
+      };
+    });
+    replaceActions(next);
   }
 
-  function persistPendingPagePositionOverride() {
-    if (mode !== 'batch' || positionTarget !== 'page' || !overrideDraftTouched) return false;
-    const minPage = Math.min(batchStart, batchEnd);
-    const maxPage = Math.max(batchStart, batchEnd);
-    const pageNumber = clampPercent(overridePage, minPage || 1, maxPage || pageCount || 1);
-    setPagePositionOverrides((list) => ({
-      ...list,
-      [pageNumber]: {
-        xPercent: clampPercent(overrideXPercent),
-        yPercent: clampPercent(overrideYPercent),
-      },
-    }));
-    setOverrideDraftTouched(false);
-    return true;
+  function endStampMove() {
+    if (!movingActionId) return;
+    const before = moveSnapshotRef.current;
+    const after = actionsRef.current;
+    if (before && !sameActionSnapshots(before, after)) {
+      const snapshot = cloneStampActions(before);
+      setUndoStack((stack) => [...stack.slice(-(MAX_ACTION_HISTORY - 1)), snapshot]);
+      setRedoStack([]);
+      setStatus(`已调整第 ${currentPage} 页印章位置。`);
+    }
+    moveSnapshotRef.current = null;
+    setMovingActionId(null);
   }
+
+  function startStampResize(event: React.PointerEvent<HTMLSpanElement>, action: NormalStamp) {
+    if (event.button !== 0 || !action.customSealId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pageElement = pageWrapRef.current;
+    if (!pageElement) return;
+    try {
+      pageElement.setPointerCapture(event.pointerId);
+    } catch {
+      // 指针捕获尽力而为，失败也不影响拖拽。
+    }
+    resizeSnapshotRef.current = cloneStampActions(actionsRef.current);
+    setResizingActionId(action.id);
+    setStatus('拖动调整自定义印章大小，松开后生效。');
+    updateStampResizeFromClientPoint(action.id, event.clientX);
+  }
+
+  function updateStampResizeFromClientPoint(actionId: string, clientX: number) {
+    const rect = pageWrapRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const target = actionsRef.current.find((item) => item.id === actionId);
+    if (!target || target.type !== 'normal') return;
+    const position = pagePosition(target, currentPage);
+    const centerXpx = (rect.width * position.xPercent) / 100;
+    const halfWidthPx = clientX - rect.left - centerXpx;
+    const widthPx = Math.max(4, halfWidthPx * 2);
+    const widthPercent = clampPercent(
+      (widthPx / rect.width) * 100,
+      MIN_CUSTOM_WIDTH_PERCENT,
+      MAX_CUSTOM_WIDTH_PERCENT,
+    );
+    const next = actionsRef.current.map((item) =>
+      item.id === actionId && item.type === 'normal'
+        ? { ...item, customWidthPercent: widthPercent }
+        : item,
+    );
+    replaceActions(next);
+  }
+
+  function endStampResize() {
+    if (!resizingActionId) return;
+    const before = resizeSnapshotRef.current;
+    const after = actionsRef.current;
+    if (before && !sameActionSnapshots(before, after)) {
+      const snapshot = cloneStampActions(before);
+      setUndoStack((stack) => [...stack.slice(-(MAX_ACTION_HISTORY - 1)), snapshot]);
+      setRedoStack([]);
+      setStatus('已调整自定义印章大小。');
+    }
+    resizeSnapshotRef.current = null;
+    setResizingActionId(null);
+  }
+
 
   function goToPage(pageNumber: number) {
     const nextPage = clampPercent(pageNumber, 1, pageCount || 1);
-    const saved = persistPendingPagePositionOverride();
     setCurrentPage(nextPage);
-    if (saved) setStatus(`已自动保存第 ${overridePage} 页的单独印章位置。`);
   }
 
   function handleDocumentWheel(event: React.WheelEvent<HTMLElement>) {
@@ -2310,42 +3066,14 @@ function App() {
     goToPage(currentPage + (event.deltaY > 0 ? 1 : -1));
   }
 
-  function clearPagePositionOverride() {
-    setPagePositionOverrides((list) => {
-      const next = { ...list };
-      delete next[overridePage];
-      return next;
-    });
-    setOverrideXPercent(xPercent);
-    setOverrideYPercent(yPercent);
-    setOverrideDraftTouched(false);
-    setPositionTarget('default');
-    setStatus(`已清除第 ${overridePage} 页的单独印章位置。`);
-  }
-
-  function pageOverridesWithPendingDrag(pages: number[]) {
-    const nextOverrides = { ...pagePositionOverrides };
-    if (positionTarget === 'page' && overrideDraftTouched) {
-      const minPage = Math.min(batchStart, batchEnd);
-      const maxPage = Math.max(batchStart, batchEnd);
-      const pageNumber = clampPercent(overridePage, minPage || 1, maxPage || pageCount || 1);
-      if (pages.includes(pageNumber)) {
-        nextOverrides[pageNumber] = {
-          xPercent: clampPercent(overrideXPercent),
-          yPercent: clampPercent(overrideYPercent),
-        };
-      }
-    }
-    return nextOverrides;
-  }
-
   function actionsWithPendingEdit() {
     const current = cloneStampActions(actions);
     if (!editingActionId) return current;
+    const customFields = buildCustomActionFields();
     if (mode === 'batch') {
       const pages = rangePages(batchStart, batchEnd, pageCount);
       if (!pages.length) return current;
-      const nextOverrides = normalizePageOverrides(pages, pageOverridesWithPendingDrag(pages), xPercent, yPercent);
+      const nextOverrides = normalizePageOverrides(pages, pagePositionOverrides, xPercent, yPercent);
       const nextAction: StampAction = {
         id: editingActionId,
         type: 'normal',
@@ -2355,6 +3083,7 @@ function App() {
         yPercent,
         sizePercent: currentSealSizePercent,
         pageOverrides: nextOverrides,
+        ...(customFields || {}),
       };
       return current.map((action) => (action.id === editingActionId ? nextAction : action));
     }
@@ -2369,6 +3098,7 @@ function App() {
         xPercent,
         yPercent,
         sizePercent: currentSealSizePercent,
+        ...(customFields || {}),
       };
       return current.map((action) => (action.id === editingActionId ? nextAction : action));
     }
@@ -2386,26 +3116,45 @@ function App() {
     return current.map((action) => (action.id === editingActionId ? nextAction : action));
   }
 
+  function buildCustomActionFields() {
+    if (!selectedCustomSeal) return undefined;
+    const existingForEdit = editingActionId
+      ? (actions.find((action) => action.id === editingActionId && action.type === 'normal') as NormalStamp | undefined)
+      : undefined;
+    const reuse = existingForEdit?.customSealId === selectedCustomSeal.id;
+    return {
+      customSealId: selectedCustomSeal.id,
+      customWidthPercent: (reuse ? existingForEdit?.customWidthPercent : undefined) ?? mmToWidthPercent(selectedCustomSeal.widthMm),
+      customAspect: (reuse ? existingForEdit?.customAspect : undefined) ?? selectedCustomSeal.aspect,
+    };
+  }
+
   function addStampAction() {
     if (!pageCount) {
       setStatus('请先上传 PDF。');
       return;
     }
-    const requiredSealKind = mode === 'seam' ? 'official' : selectedSealKind;
-    if (!activeSubject?.seals[requiredSealKind]) {
-      setStatus(`当前主体还没有上传${sealLabels[requiredSealKind]}。`);
+    const selectedSealLabel = selectedCustomSeal ? selectedCustomSeal.name : sealLabels[selectedSealKind];
+    if (mode === 'seam') {
+      if (!activeSubject?.seals.official) {
+        setStatus('当前主体还没有上传公章。');
+        return;
+      }
+    } else if (!selectedCustomSeal && !activeSubject?.seals[selectedSealKind]) {
+      setStatus(`当前主体还没有上传${sealLabels[selectedSealKind]}。`);
       return;
     }
+    const customFields = buildCustomActionFields();
     if (mode === 'batch') {
       const pages = rangePages(batchStart, batchEnd, pageCount);
       const id = editingActionId || uid('stamp');
-      const nextOverrides = normalizePageOverrides(pages, pageOverridesWithPendingDrag(pages), xPercent, yPercent);
-      const nextAction: StampAction = { id, type: 'normal', pages, sealKind: selectedSealKind, xPercent, yPercent, sizePercent: currentSealSizePercent, pageOverrides: nextOverrides };
+      const nextOverrides = normalizePageOverrides(pages, pagePositionOverrides, xPercent, yPercent);
+      const nextAction: StampAction = { id, type: 'normal', pages, sealKind: selectedSealKind, xPercent, yPercent, sizePercent: currentSealSizePercent, pageOverrides: nextOverrides, ...(customFields || {}) };
       commitActions((list) => (editingActionId
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
         : [...list, nextAction]));
       setEditingActionId(null);
-      setStatus(`${editingActionId ? '已更新' : '已添加'} ${pages.length} 页${sealLabels[selectedSealKind]}，其中 ${nextOverrides ? Object.keys(nextOverrides).length : 0} 页使用单独位置。`);
+      setStatus(`${editingActionId ? '已更新' : '已添加'} ${pages.length} 页${selectedSealLabel}，其中 ${nextOverrides ? Object.keys(nextOverrides).length : 0} 页使用单独位置。`);
     }
     if (mode === 'specific') {
       const pages = parsePageList(specificPages, pageCount);
@@ -2414,12 +3163,12 @@ function App() {
         return;
       }
       const id = editingActionId || uid('stamp');
-      const nextAction: StampAction = { id, type: 'normal', pages, sealKind: selectedSealKind, xPercent, yPercent, sizePercent: currentSealSizePercent };
+      const nextAction: StampAction = { id, type: 'normal', pages, sealKind: selectedSealKind, xPercent, yPercent, sizePercent: currentSealSizePercent, ...(customFields || {}) };
       commitActions((list) => (editingActionId
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
         : [...list, nextAction]));
       setEditingActionId(null);
-      setStatus(`已${editingActionId ? '更新' : '添加'}第 ${pages.join('、')} 页${sealLabels[selectedSealKind]}。`);
+      setStatus(`已${editingActionId ? '更新' : '添加'}第 ${pages.join('、')} 页${selectedSealLabel}。`);
     }
     if (mode === 'seam') {
       const pages = rangePages(seamStart, seamEnd, pageCount);
@@ -2463,18 +3212,22 @@ function App() {
 
     for (const action of actions) {
       if (action.type === 'normal') {
-        const dataUrl = activeSubject.seals[action.sealKind];
-        if (!dataUrl) {
-          setStatus(`当前主体缺少${sealLabels[action.sealKind]}，无法导出。`);
+        const visual = resolveStampVisual(action, activeSubject);
+        if (!visual) {
+          const missingName = action.customSealId
+            ? (findCustomSeal(activeSubject, action.customSealId)?.name || '自定义印章')
+            : sealLabels[action.sealKind];
+          setStatus(`当前主体缺少${missingName}，无法导出。`);
           return;
         }
-        const image = await getImage(action.sealKind, dataUrl);
+        const cacheKey = action.customSealId ? `custom:${action.customSealId}` : action.sealKind;
+        const image = await getImage(cacheKey, visual.src);
         action.pages.forEach((pageNumber) => {
           const page = pages[pageNumber - 1];
           if (!page) return;
           const { width, height } = page.getSize();
-          const stampWidth = (width * sealSizePercent(action.sealKind, action.sizePercent, activeSubject.sealSizes)) / 100;
-          const stampHeight = stampWidth;
+          const stampWidth = (width * visual.widthPercent) / 100;
+          const stampHeight = stampWidth * visual.aspect;
           const position = pagePosition(action, pageNumber);
           // 预览用 translate(-50%,-50%) 把印章中心对齐到 (xPercent, yPercent)，
           // 因此导出也必须把中心放在该点，保证预览与导出一致。
@@ -2747,6 +3500,19 @@ function App() {
     }
   }
 
+  function saveLoginSettings() {
+    const username = loginUsernameDraft.trim();
+    if (!username || !loginPasswordDraft) {
+      setStatus('登录账号和密码不能为空。');
+      return;
+    }
+    setLoginCredentials({ username, password: loginPasswordDraft });
+    setLoginUsernameDraft(username);
+    clearRememberedLogin();
+    setRememberLogin(false);
+    setStatus('已保存登录账号与密码，旧的免登录状态已清除。');
+  }
+
   function changeZoom(delta: number) {
     const base = fitWidth ? 1 : zoom;
     const next = Math.min(4, Math.max(0.2, Math.round((base + delta) * 100) / 100));
@@ -2778,9 +3544,9 @@ function App() {
 
   function handleLogin(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (loginName.trim() === LOGIN_USERNAME && loginPassword === LOGIN_PASSWORD) {
+    if (loginName.trim() === loginCredentials.username && loginPassword === loginCredentials.password) {
       if (rememberLogin) {
-        writeRememberedLogin();
+        writeRememberedLogin(loginCredentials.username);
       } else {
         clearRememberedLogin();
       }
@@ -2869,55 +3635,84 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <header className="topbar">
         <div className="topbar-brand">
           <div className="brand-mark"><BrandLogo size={34} /></div>
-          <div>
-            <h1>CorpSeals</h1>
-            <p>PDF 电子签章工具</p>
-          </div>
+          <h1 className="brand-wordmark">CorpSeals</h1>
+          <button
+            className="sidebar-toggle"
+            type="button"
+            onClick={() => { didAutoCollapseRef.current = true; setSidebarCollapsed((collapsed) => !collapsed); }}
+            title={sidebarCollapsed ? '展开左侧菜单' : '收起左侧菜单'}
+            aria-label={sidebarCollapsed ? '展开左侧菜单' : '收起左侧菜单'}
+            aria-pressed={sidebarCollapsed}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+          </button>
         </div>
 
-        <label className="topbar-select">
-          <span>当前主体</span>
-          <select value={activeSubject?.id || ''} onChange={(event) => setActiveSubjectId(event.target.value)}>
+        <div className="topbar-create">
+          <input
+            value={draftName}
+            onChange={(event) => setDraftName(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter') addSubject(); }}
+            placeholder="新建主体名称"
+          />
+          <button className="button primary topbar-create-btn" onClick={addSubject} title="创建主体">
+            <Plus size={16} />
+            新建
+          </button>
+        </div>
+
+        <div className="topbar-switch" title="切换主体">
+          <select
+            value={activeSubject?.id || ''}
+            onChange={(event) => setActiveSubjectId(event.target.value)}
+            style={{ width: `calc(${Math.min(16, Math.max(4, ...subjects.map((subject) => subject.name.length)))}em + 3.4rem)` }}
+          >
             {subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name}</option>)}
           </select>
-        </label>
+          <span className="topbar-switch-btn" aria-hidden="true"><ChevronDown size={16} /></span>
+        </div>
 
-        <label className="topbar-export">
-          <span>导出文件名</span>
-          <input value={exportName} onChange={(event) => setExportName(event.target.value)} placeholder="已盖章文件.pdf" />
-        </label>
+        <div className="topbar-spacer" />
 
-        <button className="button primary" onClick={exportPdf}>
-          <Download size={17} />
-          导出 PDF
-        </button>
+        <div className="topbar-export-group">
+          <input
+            className="topbar-export-input"
+            value={exportName}
+            onChange={(event) => setExportName(event.target.value)}
+            placeholder="导出文件名.pdf"
+            title="导出文件名"
+          />
+          <button className="button primary topbar-export-btn" onClick={exportPdf}>
+            <Download size={16} />
+            导出
+          </button>
+        </div>
 
-        <button className="button topbar-logout" onClick={handleLogout}>
+        <button className="icon-button topbar-logout" onClick={handleLogout} title="退出">
           <LogOut size={16} />
-          退出
         </button>
       </header>
 
       <aside className="sidebar">
         <nav className="side-rail" aria-label="工作区导航">
           <button className={`rail-item ${sideView === 'subjects' ? 'active' : ''}`} title="主体与印章" onClick={() => setSideView('subjects')}>
-            <Building2 size={18} />
+            <Building2 size={24} />
             <span>主体与印章</span>
           </button>
           <button className={`rail-item ${sideView === 'records' ? 'active' : ''}`} title="文档记录" onClick={() => setSideView('records')}>
-            <FileText size={18} />
+            <FileText size={24} />
             <span>记录</span>
           </button>
           <button className={`rail-item ${sideView === 'settings' ? 'active' : ''}`} title="设置" onClick={() => setSideView('settings')}>
-            <Settings size={18} />
+            <Settings size={24} />
             <span>设置</span>
           </button>
           <button className={`rail-item ${sideView === 'qualifications' ? 'active' : ''}`} title="主体资质管理" onClick={() => setSideView('qualifications')}>
-            <BadgeCheck size={18} />
+            <BadgeCheck size={24} />
             <span>主体资质管理</span>
           </button>
         </nav>
@@ -2925,44 +3720,17 @@ function App() {
         <div className="side-main">
           {sideView === 'subjects' && (
             <>
-              <section className="panel subject-panel">
-                <div className="section-title">
-                  <Building2 size={16} />
-                  <span>签章主体</span>
-                </div>
-                <div className="inline-form">
-                  <input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="搜索或新建主体" />
-                  <button className="icon-button primary" onClick={addSubject} title="添加主体"><Plus size={17} /></button>
-                </div>
-              </section>
-
-	              <section className="subject-list">
-	                {subjects.map((subject) => (
-                  <div
-                    className={`subject-row ${subject.id === activeSubject?.id ? 'active' : ''}`}
-                    key={subject.id}
-                    onClick={() => setActiveSubjectId(subject.id)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') setActiveSubjectId(subject.id);
-                    }}
-                    role="button"
-                    tabIndex={0}
-                  >
-                    <span>{subject.name}</span>
-                    <small>{Object.keys(subject.seals).length}/{sealKindList.length}</small>
-                    <button
-                      className="row-delete-button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        deleteSubject(subject.id);
-                      }}
-                      title="删除主体"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                ))}
+	              {subjects.some((subject) => subject.pinned) && (
+                <section className="subject-pinned" aria-label="置顶主体">
+                  {subjects.filter((subject) => subject.pinned).map(renderSubjectRow)}
+                </section>
+              )}
+	              <section className="subject-scroll">
+	                {subjects.filter((subject) => !subject.pinned).map(renderSubjectRow)}
                 {!subjects.length && <div className="empty">还没有主体。先添加一个主体，再上传印章。</div>}
+                {subjects.length > 0 && subjects.every((subject) => subject.pinned) && (
+                  <div className="subject-scroll-hint">全部主体已置顶</div>
+                )}
               </section>
 
 	              {activeSubject && (
@@ -2970,9 +3738,12 @@ function App() {
                   <div className="section-title">
                     <BadgeCheck size={16} />
                     <span>印章管理</span>
-                    <small>当前主体</small>
+                    <button type="button" className="seal-pack-button" title="打包下载全部印章（PNG）" onClick={downloadSubjectSealsZip}>
+                      <Download size={13} />
+                      打包下载
+                    </button>
+                    <small className="seal-panel-company" title={activeSubject.name}>{activeSubject.name}</small>
                   </div>
-                  <div className="active-subject-name">{activeSubject.name}</div>
                   <div className="seal-generator-tip">上传清晰红色扫描件，系统会自动去白底、裁剪多余边缘并生成透明 PNG。可在下方设定每枚印章尺寸，单位 mm。</div>
                   <div className="seal-card-list">
                     {sealKindList.map((kind) => (
@@ -2985,51 +3756,65 @@ function App() {
                         onChange={(dataUrl) => updateSubjectSeal(activeSubject.id, kind, dataUrl)}
                         onSizeChange={(mm) => updateSubjectSealSize(activeSubject.id, kind, mm)}
                         onDelete={() => deleteSubjectSeal(activeSubject.id, kind)}
+                        onDownload={() => {
+                          const dataUrl = activeSubject.seals[kind];
+                          if (dataUrl) downloadSingleSeal(sealLabels[kind], dataUrl);
+                        }}
                         onGenerated={setStatus}
                       />
                     ))}
                   </div>
 
-                  <div className="seal-drop-target">
-                    <label className="seal-drop-kind">
-                      <span>上传到</span>
-                      <select
-                        value={manageSealKind}
-                        onChange={(event) => setManageSealKind(event.target.value as SealKind)}
-                      >
-                        {sealKindList.map((kind) => (
-                          <option key={kind} value={kind}>{sealLabels[kind]}</option>
-                        ))}
-                      </select>
-                    </label>
+                  <div className="custom-seal-section">
+                    <div className="custom-seal-head">
+                      <span className="custom-seal-title">自定义印章</span>
+                      <small>{activeSubject.customSeals?.length || 0} 枚</small>
+                    </div>
+                    <div className="seal-generator-tip">
+                      上传签名章等任意印章，系统会自动去白底、裁剪空白并保留原始宽高比（不限定为正方形）。盖到 PDF 上后可拖动右下角调整大小。
+                    </div>
+                    <div className="custom-seal-list">
+                      {(activeSubject.customSeals || []).map((seal) => (
+                        <CustomSealCard
+                          key={seal.id}
+                          seal={seal}
+                          onRename={(name) => updateCustomSeal(seal.id, { name })}
+                          onWidthChange={(widthMm) => updateCustomSeal(seal.id, { widthMm: clampCustomSealMm(widthMm) })}
+                          onReplace={(file) => replaceCustomSealImage(seal.id, file)}
+                          onRotate={() => rotateCustomSeal(seal.id)}
+                          onDownload={() => downloadSingleSeal(seal.name, seal.dataUrl)}
+                          onDelete={() => deleteCustomSeal(seal.id)}
+                        />
+                      ))}
+                    </div>
                     <button
                       type="button"
-                      className={`seal-dropzone ${isSealDropActive ? 'active' : ''}`}
-                      onClick={() => sealDropInputRef.current?.click()}
+                      className={`seal-dropzone custom-seal-add ${isCustomSealDropActive ? 'active' : ''} ${isAddingCustomSeal ? 'processing' : ''}`}
+                      onClick={() => customSealInputRef.current?.click()}
                       onDragOver={(event) => {
                         event.preventDefault();
-                        setIsSealDropActive(true);
+                        setIsCustomSealDropActive(true);
                       }}
-                      onDragLeave={() => setIsSealDropActive(false)}
+                      onDragLeave={() => setIsCustomSealDropActive(false)}
                       onDrop={async (event) => {
                         event.preventDefault();
-                        setIsSealDropActive(false);
+                        setIsCustomSealDropActive(false);
                         const file = event.dataTransfer.files?.[0];
-                        if (file) await importSealForKind(manageSealKind, file);
+                        if (file) await addCustomSeal(file);
                       }}
                     >
-                      <Upload size={22} />
-                      <strong>点击或拖拽上传印章</strong>
-                      <small>支持 PNG / JPG 格式，建议 512px 以上</small>
+                      <Plus size={20} />
+                      <strong>{isAddingCustomSeal ? '正在处理…' : '添加自定义印章'}</strong>
+                      <small>点击或拖拽上传 PNG / JPG，自动去白底</small>
                     </button>
                     <input
-                      ref={sealDropInputRef}
+                      ref={customSealInputRef}
                       type="file"
                       accept="image/png,image/jpeg"
                       onChange={async (event) => {
                         const file = event.target.files?.[0];
                         event.target.value = '';
-                        if (file) await importSealForKind(manageSealKind, file);
+                        if (file) await addCustomSeal(file);
                       }}
                     />
                   </div>
@@ -3049,36 +3834,38 @@ function App() {
                 导出的盖章 PDF 和关闭保存的用章流程都会留存在这里。最多保留最近 50 条。
               </div>
               <div className="record-file-list">
-                {records.map((record) => (
-                  <div className="record-file-card" key={record.id}>
-                    <div className="record-file-main">
-                      <FileText size={16} />
-                      <div className="record-file-text">
-                        <strong title={record.name}>{record.name}</strong>
-                        <span>
-                          {record.kind === 'workflow' ? '用章流程' : '导出文件'} · {record.subjectName} · {record.pageCount} 页 · {record.actionCount} 个用章
+                {records.map((record) => {
+                  const isWorkflow = record.kind === 'workflow';
+                  const shortDate = record.createdAt?.length >= 16 ? record.createdAt.slice(5, 16) : record.createdAt;
+                  return (
+                    <div className="record-file-card" key={record.id}>
+                      <span className={`record-file-icon ${isWorkflow ? 'workflow' : 'export'}`}>
+                        <FileText size={15} />
+                      </span>
+                      <div className="record-file-body">
+                        <strong className="record-file-name" title={record.name}>{record.name}</strong>
+                        <span className="record-file-meta" title={`${record.subjectName} · ${record.pageCount} 页 · ${record.actionCount} 个用章`}>
+                          {isWorkflow ? '流程' : '导出'} · {record.subjectName} · {record.pageCount}页 · {record.actionCount}枚章
                         </span>
-                        <small>{record.createdAt}</small>
+                        <span className="record-file-date">{shortDate}</span>
+                      </div>
+                      <div className="record-file-actions">
+                        {isWorkflow ? (
+                          <button className="record-act-btn" title="继续用章流程" aria-label="继续用章流程" onClick={() => resumeWorkflowRecord(record)}>
+                            <ArrowRight size={16} />
+                          </button>
+                        ) : (
+                          <button className="record-act-btn" title="下载文件" aria-label="下载文件" onClick={() => redownloadRecord(record)}>
+                            <Download size={15} />
+                          </button>
+                        )}
+                        <button className="record-act-btn danger" title="删除记录" aria-label="删除记录" onClick={() => deleteRecord(record)}>
+                          <Trash2 size={15} />
+                        </button>
                       </div>
                     </div>
-                    <div className="record-file-actions">
-                      {record.kind === 'workflow' ? (
-                        <button className="button" onClick={() => resumeWorkflowRecord(record)}>
-                          <FileText size={14} />
-                          继续
-                        </button>
-                      ) : (
-                        <button className="button" onClick={() => redownloadRecord(record)}>
-                          <Download size={14} />
-                          下载
-                        </button>
-                      )}
-                      <button className="icon-button danger-action" title="删除记录" onClick={() => deleteRecord(record)}>
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
                 {!records.length && <div className="empty">暂无用章文件记录。导出 PDF 或关闭保存流程后会显示在这里。</div>}
 	              </div>
             </section>
@@ -3094,7 +3881,6 @@ function App() {
                 <div className="settings-row">
                   <div>
                     <strong>界面配色</strong>
-                    <span>选择侧边栏、按钮和高亮色，红色为默认配色</span>
                   </div>
                   <div className="theme-options" role="group" aria-label="界面配色">
                     {colorThemeList.map((theme) => (
@@ -3105,10 +3891,40 @@ function App() {
                         onClick={() => setColorTheme(theme)}
                         aria-pressed={colorTheme === theme}
                       >
-                        <span className="theme-dot" />
                         {colorThemeLabels[theme]}
                       </button>
                     ))}
+                  </div>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>登录账号</strong>
+                    <span>自定义进入工作台的账号与密码，保存后下次登录生效</span>
+                  </div>
+                  <div className="login-settings-grid">
+                    <div className="login-field">
+                      <input
+                        value={loginUsernameDraft}
+                        autoComplete="off"
+                        onChange={(event) => setLoginUsernameDraft(event.target.value)}
+                        placeholder="请输入登录账号"
+                      />
+                      <span className="login-field-suffix"><User size={15} /></span>
+                    </div>
+                    <div className="login-field">
+                      <input
+                        value={loginPasswordDraft}
+                        autoComplete="off"
+                        onChange={(event) => setLoginPasswordDraft(event.target.value)}
+                        placeholder="请输入登录密码"
+                        type="password"
+                      />
+                      <span className="login-field-suffix"><Lock size={15} /></span>
+                    </div>
+                    <button className="button" type="button" onClick={saveLoginSettings}>
+                      <Save size={15} />
+                      保存登录设置
+                    </button>
                   </div>
                 </div>
                 <div className="settings-row">
@@ -3149,8 +3965,26 @@ function App() {
                 <div className="settings-row settings-danger-row">
                   <div>
                     <strong>危险区</strong>
-                    <span>{subjects.length ? `删除全部 ${subjects.length} 个主体、印章和资质材料` : '暂无主体数据'}</span>
+                    <span>{subjects.length ? `共 ${subjects.length} 个主体，可单独或全部删除` : '暂无主体数据'}</span>
                   </div>
+                  {subjects.length > 0 && (
+                    <div className="danger-subject-list">
+                      {subjects.map((subject) => (
+                        <div className="danger-subject-row" key={subject.id}>
+                          <span className="danger-subject-name" title={subject.name}>{subject.name}</span>
+                          <button
+                            className="danger-subject-del"
+                            type="button"
+                            title={`删除「${subject.name}」`}
+                            aria-label={`删除「${subject.name}」`}
+                            onClick={() => deleteSubject(subject.id)}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <button className="button danger-action" disabled={!subjects.length} onClick={clearSubjects}>
                     <Trash2 size={15} />
                     全部删除主体
@@ -3227,17 +4061,18 @@ function App() {
                 onClick={() => qualificationInputRef.current?.click()}
               >
                 <Upload size={16} />
-                上传主体资料
+                上传资料（可多选）
               </button>
               <input
                 ref={qualificationInputRef}
                 className="qualification-file-input"
                 type="file"
+                multiple
                 accept="application/pdf,image/png,image/jpeg,image/webp,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.doc,.docx,.rtf"
                 onChange={async (event) => {
-                  const file = event.target.files?.[0];
+                  const files = Array.from(event.target.files ?? []);
                   event.target.value = '';
-                  if (file) await addQualificationFile(file);
+                  if (files.length) await addQualificationFiles(files);
                 }}
               />
             </div>
@@ -3414,25 +4249,63 @@ function App() {
                     ref={pageWrapRef}
                     onPointerDown={startPagePositioning}
                     onPointerMove={(event) => {
+                      if (resizingActionId) {
+                        updateStampResizeFromClientPoint(resizingActionId, event.clientX);
+                        return;
+                      }
+                      if (movingActionId) {
+                        updateStampMoveFromClientPoint(movingActionId, event.clientX, event.clientY);
+                        return;
+                      }
                       if (isPositioningStamp) updatePagePositionFromPointer(event);
                     }}
-                    onPointerUp={() => setIsPositioningStamp(false)}
-                    onPointerCancel={() => setIsPositioningStamp(false)}
+                    onPointerUp={() => {
+                      if (resizingActionId) endStampResize();
+                      if (movingActionId) endStampMove();
+                      setIsPositioningStamp(false);
+                    }}
+                    onPointerCancel={() => {
+                      if (resizingActionId) endStampResize();
+                      if (movingActionId) endStampMove();
+                      setIsPositioningStamp(false);
+                    }}
                   >
                     <PageCanvas pdfDocument={pdfDocument} pageNumber={currentPage} zoom={zoom} fitWidth={fitWidth} onRendered={setRenderPage} />
                     {currentActions.filter((action) => action.id !== editingActionId).map((action) => {
                       if (!activeSubject) return null;
                       if (action.type === 'normal') {
-                        const sealSrc = activeSubject.seals[action.sealKind];
-                        if (!sealSrc) return null;
-                        const width = (renderPage.width * sealSizePercent(action.sealKind, action.sizePercent, activeSubject.sealSizes)) / 100;
-                        const height = width;
+                        const visual = resolveStampVisual(action, activeSubject);
+                        if (!visual) return null;
+                        const width = (renderPage.width * visual.widthPercent) / 100;
+                        const height = width * visual.aspect;
                         const position = pagePosition(action, currentPage);
+                        if (action.customSealId) {
+                          return (
+                            <div
+                              key={action.id}
+                              className={`stamp-preview custom-stamp-preview interactive-stamp-preview ${resizingActionId === action.id ? 'resizing' : ''}`}
+                              onPointerDown={(event) => startExistingStampPositioning(event, action)}
+                              style={{
+                                width,
+                                height,
+                                left: `${position.xPercent}%`,
+                                top: `${position.yPercent}%`,
+                              }}
+                            >
+                              <img src={visual.src} alt="stamp" draggable={false} />
+                              <span
+                                className="stamp-resize-handle"
+                                title="拖动调整大小"
+                                onPointerDown={(event) => startStampResize(event, action)}
+                              />
+                            </div>
+                          );
+                        }
                         return (
                           <img
                             key={action.id}
                             className="stamp-preview interactive-stamp-preview"
-                            src={sealSrc}
+                            src={visual.src}
                             alt="stamp"
                             draggable={false}
                             onPointerDown={(event) => startExistingStampPositioning(event, action)}
@@ -3487,8 +4360,8 @@ function App() {
                         src={draftSealSrc}
                         alt="stamp draft"
                         style={{
-                          width: (renderPage.width * currentSealSizePercent) / 100,
-                          height: (renderPage.width * currentSealSizePercent) / 100,
+                          width: (renderPage.width * draftWidthPercent) / 100,
+                          height: (renderPage.width * draftWidthPercent * draftAspect) / 100,
                           left: `${effectiveDraftXPercent}%`,
                           top: `${effectiveDraftYPercent}%`,
                         }}
@@ -3533,7 +4406,7 @@ function App() {
               <div className="seal-kind-grid">
                 {sealKindList.map((kind) => {
                   const sealSource = activeSubject?.seals[kind];
-                  const isSelected = selectedSealKind === kind;
+                  const isSelected = selectedSealKind === kind && !selectedCustomSealId;
                   return (
                     <button
                       className={`seal-kind-option ${isSelected ? 'active' : ''}`}
@@ -3541,7 +4414,7 @@ function App() {
                       type="button"
                       aria-label={sealLabels[kind]}
                       aria-pressed={isSelected}
-                      onClick={() => setSelectedSealKind(kind)}
+                      onClick={() => { setSelectedSealKind(kind); setSelectedCustomSealId(null); }}
                     >
                       <span className="seal-kind-thumb">
                         {sealSource ? <img src={sealSource} alt="" /> : <small>未上传</small>}
@@ -3551,62 +4424,39 @@ function App() {
                     </button>
                   );
                 })}
+                {(activeSubject?.customSeals || []).map((seal) => {
+                  const isSelected = selectedCustomSealId === seal.id;
+                  return (
+                    <button
+                      className={`seal-kind-option ${isSelected ? 'active' : ''}`}
+                      key={seal.id}
+                      type="button"
+                      aria-label={seal.name}
+                      aria-pressed={isSelected}
+                      onClick={() => setSelectedCustomSealId(seal.id)}
+                    >
+                      <span className="seal-kind-thumb">
+                        <img src={seal.dataUrl} alt="" />
+                      </span>
+                      <span className="seal-kind-name">{seal.name}</span>
+                      {isSelected && <BadgeCheck className="seal-kind-check" size={15} />}
+                    </button>
+                  );
+                })}
               </div>
             </div>
-            <div className="position-readout">
-              <span>{mode === 'batch' ? '批量默认位置' : '印章位置'}</span>
-              <b>{xPercent}% / {yPercent}%</b>
-            </div>
             {mode === 'batch' && (
-              <div className="page-override-panel">
-                <div className="page-override-head">
-                  <strong>单页位置微调</strong>
-                  <span>{Object.keys(pagePositionOverrides).length} 页已设置</span>
-                </div>
-                <div className="position-target-tabs">
-                  <button className={positionTarget === 'default' ? 'active' : ''} type="button" onClick={() => setPositionTarget('default')}>
-                    默认位置
-                  </button>
-                  <button className={positionTarget === 'page' ? 'active' : ''} type="button" onClick={() => { setPositionTarget('page'); goToPage(overridePage); }}>
-                    本页位置
-                  </button>
-                </div>
-                <label>
-                  微调页
-                  <input
-                    type="number"
-                    min={Math.min(batchStart, batchEnd) || 1}
-                    max={Math.max(batchStart, batchEnd) || pageCount || 1}
-                    value={overridePage}
-                    onChange={(event) => {
-                      const minPage = Math.min(batchStart, batchEnd) || 1;
-                      const maxPage = Math.max(batchStart, batchEnd) || pageCount || 1;
-                      const pageNumber = clampPercent(Number(event.target.value), minPage, maxPage);
-                      setOverridePage(pageNumber);
-                      goToPage(pageNumber);
-                      setPositionTarget('page');
-                    }}
-                  />
-                </label>
-                <div className="position-readout compact">
-                  <span>本页位置</span>
-                  <b>{overrideXPercent}% / {overrideYPercent}%</b>
-                </div>
-                <div className="page-override-actions">
-                  <button className="button" type="button" onClick={savePagePositionOverride}>
-                    <Save size={15} />
-                    保存本页位置
-                  </button>
-                  <button className="button danger-action" type="button" disabled={!pagePositionOverrides[overridePage]} onClick={clearPagePositionOverride}>
-                    <RotateCcw size={15} />
-                    清除
-                  </button>
-                </div>
+              <div className="batch-position-tip">
+                所有页将盖在同一位置。要单独调整某一页，翻到该页后直接拖动印章即可，松手自动生效。
               </div>
             )}
             <div className="fixed-size-field">
               <span>印章尺寸</span>
-              <b>{sealSizeText(selectedSealKind, activeSubject?.sealSizes)}</b>
+              <b>
+                {selectedCustomSeal
+                  ? `${selectedCustomSeal.widthMm} × ${Math.round(selectedCustomSeal.widthMm * selectedCustomSeal.aspect)} mm · 可拖拽缩放`
+                  : sealSizeText(selectedSealKind, activeSubject?.sealSizes)}
+              </b>
             </div>
           </div>
         ) : (
@@ -3617,19 +4467,15 @@ function App() {
             </div>
             <label>拆分份数 <b>{splitCount}</b><input type="range" min={pageCount > 1 ? 2 : 1} max={Math.max(pageCount > 1 ? 2 : 1, pageCount || 12)} value={splitCount} onChange={(event) => setSplitCount(Number(event.target.value))} /></label>
             <div className="fixed-size-field">
-              <span>当前位置</span>
-              <b>纵向 {seamY}% · 右侧 {seamInset}%</b>
-            </div>
-            <div className="fixed-size-field">
               <span>骑缝章尺寸</span>
               <b>{sealSizeText('official', activeSubject?.sealSizes)}</b>
             </div>
           </div>
         )}
 
-        <button className="button primary full" onClick={addStampAction}>
-          <Save size={17} />
-          {editingActionId ? '保存调整' : mode === 'seam' ? '添加骑缝章' : '添加到 PDF'}
+        <button className="button primary full addstamp-button" onClick={addStampAction}>
+          <Stamp size={18} />
+          {editingActionId ? '保存调整' : mode === 'seam' ? '添加骑缝章' : '印签到文件'}
         </button>
         {editingActionId && (
           <button className="button full secondary-action" onClick={() => setEditingActionId(null)}>
@@ -3651,7 +4497,7 @@ function App() {
           </div>
           {actions.map((action) => {
             const seam = action.type === 'seam';
-            const iconClass = seam ? 'seam' : action.sealKind;
+            const iconClass = seam ? 'seam' : action.customSealId ? 'custom' : action.sealKind;
             return (
               <div
                 className={`op-row ${editingActionId === action.id ? 'active' : ''}`}
@@ -3667,7 +4513,7 @@ function App() {
                   {seam ? <Scissors size={16} /> : <Stamp size={16} />}
                 </span>
                 <div className="op-body">
-                  <span className="op-title">{actionTitle(action)}</span>
+                  <span className="op-title">{actionTitle(action, activeSubject)}</span>
                   <span className="op-meta">
                     第 {pagesToRangeText(action.pages)} 页 · 共 {action.pages.length} 页
                   </span>
