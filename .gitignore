@@ -32,3 +32,6 @@ Thumbs.db
 .env
 .env.*
 
+# Vite 热更新临时文件
+vite.config.ts.timestamp-*.mjs
+
