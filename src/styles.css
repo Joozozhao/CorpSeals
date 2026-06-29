@@ -1476,10 +1476,21 @@ button:disabled {
 .topbar-export-group {
   display: flex;
   align-items: center;
+  gap: 8px;
+}
+
+.topbar-export-join {
+  display: flex;
+  align-items: center;
+}
+
+.topbar-scan-select {
+  width: 100px;
+  cursor: pointer;
 }
 
 .topbar-export-input {
-  width: 212px;
+  width: 180px;
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
   position: relative;
@@ -1794,12 +1805,59 @@ button:disabled {
   max-width: 100%;
 }
 
+@keyframes stamp-drop {
+  0% {
+    transform: translate(-50%, -50%) scale(1.32);
+    opacity: 0.4;
+    filter: brightness(1.6) drop-shadow(0 0 12px var(--seal));
+  }
+  40% {
+    transform: translate(-50%, -50%) scale(0.96);
+    opacity: 1;
+    filter: brightness(1.1) drop-shadow(0 0 6px var(--seal));
+  }
+  70% {
+    transform: translate(-50%, -50%) scale(1.02);
+    filter: drop-shadow(0 0 3px var(--seal));
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0.9;
+    filter: none;
+  }
+}
+
+@keyframes status-highlight {
+  0% {
+    background: var(--seal);
+    color: #fff;
+    border-left-color: var(--seal-dark);
+  }
+  55% {
+    background: var(--seal);
+    color: #fff;
+  }
+  100% {
+    background: var(--seal-soft);
+    color: var(--seal-dark);
+    border-left-color: var(--seal);
+  }
+}
+
 .stamp-preview {
   position: absolute;
   transform: translate(-50%, -50%);
   object-fit: contain;
   opacity: 0.9;
   pointer-events: none;
+}
+
+.stamp-flash {
+  animation: stamp-drop 0.55s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.status-flash {
+  animation: status-highlight 0.9s ease-out forwards;
 }
 
 .interactive-stamp-preview {
@@ -3310,6 +3368,22 @@ input[type='range'] {
   font-size: 15px;
   font-weight: 850;
   color: var(--text);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.download-dialog-filename {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted, #6b7280);
+  white-space: nowrap;
+}
+
+.watermark-scale-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
 }
 
 .download-dialog-body {

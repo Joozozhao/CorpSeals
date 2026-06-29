@@ -11,7 +11,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "electron": "electron .",
     "dist:mac": "npm run build && electron-builder --mac dmg",
-    "dist:win": "npm run build && electron-builder --win nsis portable"
+    "dist:win": "npm run build && electron-builder --win --x64"
   },
   "build": {
     "appId": "com.corpseal.app",

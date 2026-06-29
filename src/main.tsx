@@ -91,6 +91,8 @@ type Subject = {
 
 type SealPosition = 'tl' | 'tr' | 'bl' | 'br' | 'center';
 
+type WatermarkScale = 'small' | 'medium' | 'large';
+
 type Qualification = {
   id: string;
   name: string;
@@ -99,6 +101,7 @@ type Qualification = {
   purpose: string;
   addSeal: boolean;
   addWatermark: boolean;
+  watermarkScale?: WatermarkScale;
   sealPosition?: SealPosition;
 };
 
@@ -116,6 +119,7 @@ type MaterialQualificationEntry = {
   purpose: string;
   addSeal: boolean;
   addWatermark: boolean;
+  watermarkScale?: WatermarkScale;
   sealPosition?: SealPosition;
 };
 
@@ -407,7 +411,7 @@ function normalizePersistedAppData(value: PersistedAppData | null | undefined): 
       : [],
     activeSubjectId: value.activeSubjectId || '',
     actions: Array.isArray(value.actions) ? value.actions : [],
-    exportName: value.exportName || '已盖章文件_已电子签章.pdf',
+    exportName: value.exportName || '已盖章文件【已签】.pdf',
     records: Array.isArray(value.records) ? value.records : [],
     colorTheme,
     loginCredentials,
@@ -807,9 +811,33 @@ function estimateBorderBackground(data: Uint8ClampedArray, width: number, height
   return { bg, uniform: within / samples.length >= 0.62 };
 }
 
+// 采样图像指定矩形区域内的像素，返回各通道中位数颜色，用于角点背景估计。
+function sampleRegionMedian(
+  data: Uint8ClampedArray,
+  x0: number, y0: number, x1: number, y1: number,
+  width: number,
+): [number, number, number] | null {
+  const samples: Array<[number, number, number]> = [];
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      const i = (y * width + x) * 4;
+      if (data[i + 3] < 20) continue;
+      samples.push([data[i], data[i + 1], data[i + 2]]);
+    }
+  }
+  if (!samples.length) return null;
+  const median = (ch: number) => {
+    const s = samples.map((p) => p[ch]).sort((a, b) => a - b);
+    return s[s.length >> 1];
+  };
+  return [median(0), median(1), median(2)];
+}
+
 // 自定义印章抠图核心（纯函数，便于单测）：
-// 采样实际背景色（白底/米黄底/任意纯色底均可），用「边缘连通漫水 + 全局相近色」
+// 采样实际背景色（白底/米黄底/任意纯色底 / 渐变底均可），用「边缘连通漫水 + 全局相近色」
 // 两步把背景设为透明，保留任意颜色的笔迹/图案，边缘做柔和羽化。返回内容边界框。
+// 渐变背景增强：分别采样四角颜色，若角点差异显著则对每个像素做双线性插值估算局部背景色，
+// 大幅提升灰色渐变纸底、彩色纸质扫描件的抠图效果。
 function removeFlatBackground(data: Uint8ClampedArray, width: number, height: number) {
   const info = estimateBorderBackground(data, width, height);
   const total = width * height;
@@ -821,10 +849,50 @@ function removeFlatBackground(data: Uint8ClampedArray, width: number, height: nu
   const tolSpeck = useDetectedBg ? 76 : 50;
   const featherBand = 44;
 
+  // 渐变背景检测：采样四个角落的区域颜色，若任意两角色差 > 25 则判为渐变底。
+  const pad = Math.max(3, Math.min(Math.floor(Math.min(width, height) * 0.08), 32));
+  const cTL = sampleRegionMedian(data, 0, 0, pad, pad, width);
+  const cTR = sampleRegionMedian(data, width - pad, 0, width, pad, width);
+  const cBL = sampleRegionMedian(data, 0, height - pad, pad, height, width);
+  const cBR = sampleRegionMedian(data, width - pad, height - pad, width, height, width);
+  const validCorners = [cTL, cTR, cBL, cBR].filter((c): c is [number, number, number] => c !== null);
+
+  let isGradientBg = false;
+  if (validCorners.length >= 2 && useDetectedBg) {
+    let maxCornerDiff = 0;
+    for (let i = 0; i < validCorners.length; i += 1) {
+      for (let j = i + 1; j < validCorners.length; j += 1) {
+        const d = colorDistance(validCorners[i][0], validCorners[i][1], validCorners[i][2], validCorners[j]);
+        if (d > maxCornerDiff) maxCornerDiff = d;
+      }
+    }
+    isGradientBg = maxCornerDiff > 25;
+  }
+
+  // 渐变背景下，对每个像素位置做双线性插值估算局部背景色，替代全局单一参考色。
+  const getBgAt = isGradientBg
+    ? (idx: number): [number, number, number] => {
+        const x = idx % width;
+        const y = (idx / width) | 0;
+        const tx = width > 1 ? x / (width - 1) : 0;
+        const ty = height > 1 ? y / (height - 1) : 0;
+        const tl = cTL || ref;
+        const tr = cTR || ref;
+        const bl = cBL || ref;
+        const br = cBR || ref;
+        return [
+          tl[0] * (1 - tx) * (1 - ty) + tr[0] * tx * (1 - ty) + bl[0] * (1 - tx) * ty + br[0] * tx * ty,
+          tl[1] * (1 - tx) * (1 - ty) + tr[1] * tx * (1 - ty) + bl[1] * (1 - tx) * ty + br[1] * tx * ty,
+          tl[2] * (1 - tx) * (1 - ty) + tr[2] * tx * (1 - ty) + bl[2] * (1 - tx) * ty + br[2] * tx * ty,
+        ];
+      }
+    : null;
+
   const isBackground = new Uint8Array(total);
   const distAt = (idx: number) => {
     const i = idx * 4;
-    return colorDistance(data[i], data[i + 1], data[i + 2], ref);
+    const localRef = getBgAt ? getBgAt(idx) : ref;
+    return colorDistance(data[i], data[i + 1], data[i + 2], localRef);
   };
   const isTransparent = (idx: number) => data[idx * 4 + 3] < 24;
 
@@ -959,13 +1027,32 @@ async function generateCustomSealFromImage(file: File) {
   return { dataUrl, aspect: cropHeight / cropWidth };
 }
 
-// 平铺水印：45° 斜度、20px 宋体、灰色、透明度 20%。
+// 水印档位：fontScale 控制字号倍率，densityScale 控制间距（值越大越疏，越小越密）。
+// 中（默认）= 当前效果；小 = 字小且更密；大 = 字大且更疏。
+const WATERMARK_SCALE_LABELS: Record<WatermarkScale, string> = {
+  small: '小而密',
+  medium: '刚刚好',
+  large: '大而肥',
+};
+const WATERMARK_SCALE_LIST: WatermarkScale[] = ['small', 'medium', 'large'];
+const WATERMARK_SCALE_FACTORS: Record<WatermarkScale, { font: number; density: number }> = {
+  small: { font: 0.7, density: 0.65 },
+  medium: { font: 1, density: 1 },
+  large: { font: 1.4, density: 1.35 },
+};
+
+function normalizeWatermarkScale(value: WatermarkScale | undefined): WatermarkScale {
+  return value && WATERMARK_SCALE_LABELS[value] ? value : 'medium';
+}
+
+// 平铺水印：45° 斜度、宋体、灰色、透明度 20%。fontPx 与 density 共同决定大小与密度。
 function drawTiledWatermark(
   context: CanvasRenderingContext2D,
   text: string,
   width: number,
   height: number,
   fontPx = 20,
+  density = 1,
 ) {
   context.save();
   context.font = `${fontPx}px "SimSun", "STSong", "Songti SC", "宋体", serif`;
@@ -973,8 +1060,11 @@ function drawTiledWatermark(
   context.textAlign = 'left';
   context.textBaseline = 'middle';
   const textWidth = Math.max(fontPx * 4, context.measureText(text).width);
-  const stepX = textWidth + fontPx * 4;
-  const stepY = fontPx * 6;
+  // density 仅控制文字之间的「额外间距」，不缩放 textWidth 本身，避免：
+  //   - 小档 density<1 时 stepX 小于 textWidth，导致相邻水印水平重叠；
+  //   - 大档 density>1 时把整个 step 撑得过大，使对角行罕见而显得"被切割"。
+  const stepX = textWidth + fontPx * Math.max(2.4, 4 * density);
+  const stepY = fontPx * Math.max(3.5, 3 + 3 * density);
   const diag = Math.ceil(Math.sqrt(width * width + height * height));
   context.translate(width / 2, height / 2);
   context.rotate(-Math.PI / 4);
@@ -986,13 +1076,13 @@ function drawTiledWatermark(
   context.restore();
 }
 
-function createPageWatermarkCanvas(text: string, width: number, height: number, fontPx = 20) {
+function createPageWatermarkCanvas(text: string, width: number, height: number, fontPx = 20, density = 1) {
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(width));
   canvas.height = Math.max(1, Math.round(height));
   const context = canvas.getContext('2d');
   if (!context) throw new Error('无法生成水印');
-  drawTiledWatermark(context, text, canvas.width, canvas.height, fontPx);
+  drawTiledWatermark(context, text, canvas.width, canvas.height, fontPx, density);
   return canvas;
 }
 
@@ -1014,6 +1104,7 @@ async function downloadQualificationFile(qualification: Qualification, subject: 
   const watermarkText = qualificationWatermarkText(qualification);
   const shouldSeal = Boolean(qualification.addSeal && subject.seals.official);
   const shouldWatermark = qualification.addWatermark;
+  const scaleFactor = WATERMARK_SCALE_FACTORS[normalizeWatermarkScale(qualification.watermarkScale)];
 
   if (qualification.mimeType === 'application/pdf') {
     const pdfDoc = await PDFDocument.load(dataUrlToBytes(qualification.dataUrl));
@@ -1025,7 +1116,13 @@ async function downloadQualificationFile(qualification: Qualification, subject: 
     for (const page of pdfPages) {
       const { width, height } = page.getSize();
       if (shouldWatermark) {
-        const watermarkCanvas = createPageWatermarkCanvas(watermarkText, width * 2, height * 2, 40);
+        const watermarkCanvas = createPageWatermarkCanvas(
+          watermarkText,
+          width * 2,
+          height * 2,
+          Math.max(12, Math.round(40 * scaleFactor.font)),
+          scaleFactor.density,
+        );
         const watermarkImage = await embedImage(pdfDoc, await canvasToPngDataUrl(watermarkCanvas));
         page.drawImage(watermarkImage, { x: 0, y: 0, width, height });
       }
@@ -1071,8 +1168,8 @@ async function downloadQualificationFile(qualification: Qualification, subject: 
     context.drawImage(image, 0, 0, canvas.width, canvas.height);
     if (shouldWatermark) {
       // 按画布尺寸缩放字号，使视觉接近 20px 宋体的密度。
-      const fontPx = Math.max(20, Math.round(canvas.width * 0.018));
-      drawTiledWatermark(context, watermarkText, canvas.width, canvas.height, fontPx);
+      const fontPx = Math.max(12, Math.round(canvas.width * 0.018 * scaleFactor.font));
+      drawTiledWatermark(context, watermarkText, canvas.width, canvas.height, fontPx, scaleFactor.density);
     }
     if (shouldSeal && subject.seals.official) {
       const seal = await imageElement(subject.seals.official);
@@ -1132,6 +1229,84 @@ async function dataUrlToPngBytes(dataUrl: string) {
   if (!context) return dataUrlToBytes(dataUrl);
   context.drawImage(image, 0, 0);
   return dataUrlToBytes(await canvasToPngDataUrl(canvas));
+}
+
+// 扫描版导出：把页面位图加工成「扫描仪扫出来」的质感。
+type ScanLevel = 'light' | 'medium' | 'strong';
+type ScanPreset = {
+  contrast: number;
+  brightness: number;
+  desat: number;
+  noise: number;
+  vignette: number;
+  angle: number;
+  paper: [number, number, number];
+  jpeg: number;
+};
+const SCAN_PRESETS: Record<ScanLevel, ScanPreset> = {
+  light: { contrast: 1.05, brightness: 2, desat: 0.05, noise: 8, vignette: 0.05, angle: 0.45, paper: [252, 251, 247], jpeg: 0.86 },
+  medium: { contrast: 1.09, brightness: 3, desat: 0.09, noise: 14, vignette: 0.09, angle: 0.95, paper: [250, 247, 240], jpeg: 0.82 },
+  strong: { contrast: 1.14, brightness: 4, desat: 0.13, noise: 21, vignette: 0.14, angle: 1.5, paper: [247, 243, 233], jpeg: 0.78 },
+};
+
+// 在画布上叠加扫描质感：对比度/亮度、轻微去饱和、纸张暖色调、暗角、亮度噪点。
+function applyScanEffect(context: CanvasRenderingContext2D, width: number, height: number, preset: ScanPreset) {
+  const imageData = context.getImageData(0, 0, width, height);
+  const data = imageData.data;
+  const cx = width / 2;
+  const cy = height / 2;
+  const maxDistSq = cx * cx + cy * cy || 1;
+  const pr = preset.paper[0] / 255;
+  const pg = preset.paper[1] / 255;
+  const pb = preset.paper[2] / 255;
+  for (let y = 0; y < height; y += 1) {
+    const dy = y - cy;
+    for (let x = 0; x < width; x += 1) {
+      const i = (y * width + x) * 4;
+      let r = data[i];
+      let g = data[i + 1];
+      let b = data[i + 2];
+      r = (r - 128) * preset.contrast + 128 + preset.brightness;
+      g = (g - 128) * preset.contrast + 128 + preset.brightness;
+      b = (b - 128) * preset.contrast + 128 + preset.brightness;
+      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+      r += (gray - r) * preset.desat;
+      g += (gray - g) * preset.desat;
+      b += (gray - b) * preset.desat;
+      // 先截断到 0–255 确定白点，再乘纸色（255→纸色），让全图的白都呈暖纸色。
+      r = r < 0 ? 0 : r > 255 ? 255 : r;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      b = b < 0 ? 0 : b > 255 ? 255 : b;
+      r *= pr;
+      g *= pg;
+      b *= pb;
+      const dx = x - cx;
+      const vig = 1 - preset.vignette * ((dx * dx + dy * dy) / maxDistSq);
+      r *= vig;
+      g *= vig;
+      b *= vig;
+      const n = (Math.random() - 0.5) * preset.noise;
+      data[i] = clampByte(r + n);
+      data[i + 1] = clampByte(g + n);
+      data[i + 2] = clampByte(b + n);
+    }
+  }
+  context.putImageData(imageData, 0, 0);
+}
+
+// 把整页图轻微旋转一点（模拟纸张放歪），露出的四角填纸张色。
+function rotateCanvasOntoPaper(source: HTMLCanvasElement, angleDeg: number, paper: [number, number, number]) {
+  const out = document.createElement('canvas');
+  out.width = source.width;
+  out.height = source.height;
+  const context = out.getContext('2d');
+  if (!context) return source;
+  context.fillStyle = `rgb(${paper[0]}, ${paper[1]}, ${paper[2]})`;
+  context.fillRect(0, 0, out.width, out.height);
+  context.translate(out.width / 2, out.height / 2);
+  context.rotate((angleDeg * Math.PI) / 180);
+  context.drawImage(source, -source.width / 2, -source.height / 2);
+  return out;
 }
 
 function bytesToDataUrl(bytes: Uint8Array, mimeType: string) {
@@ -1343,7 +1518,7 @@ function areContinuousPages(pages: number[]) {
   return sorted.length > 1 && sorted.every((page, index) => index === 0 || page === sorted[index - 1] + 1);
 }
 
-const EXPORT_SUFFIX = '_已电子签章';
+const EXPORT_SUFFIX = '【已签】';
 
 function defaultExportName(fileName: string) {
   const baseName = fileName.replace(/\.pdf$/i, '').trim();
@@ -1993,11 +2168,12 @@ function App() {
   const [undoStack, setUndoStack] = useState<StampAction[][]>([]);
   const [redoStack, setRedoStack] = useState<StampAction[][]>([]);
   const [editingActionId, setEditingActionId] = useState<string | null>(null);
-  const [exportName, setExportName] = useState('已盖章文件_已电子签章.pdf');
+  const [exportName, setExportName] = useState('已盖章文件【已签】.pdf');
+  const [scanMode, setScanMode] = useState<'off' | ScanLevel>('off');
   const [records, setRecords] = useState<ExportRecord[]>([]);
   const [colorTheme, setColorTheme] = useState<ColorTheme>('red');
   const [previewQualification, setPreviewQualification] = useState<Qualification | null>(null);
-  const [downloadConfig, setDownloadConfig] = useState<{ id: string; name: string; purpose: string; addSeal: boolean; addWatermark: boolean; sealPosition: SealPosition } | null>(null);
+  const [downloadConfig, setDownloadConfig] = useState<{ id: string; name: string; purpose: string; addSeal: boolean; addWatermark: boolean; watermarkScale: WatermarkScale; sealPosition: SealPosition } | null>(null);
   const [isPositioningStamp, setIsPositioningStamp] = useState(false);
   const [batchStart, setBatchStart] = useState(1);
   const [batchEnd, setBatchEnd] = useState(1);
@@ -2025,6 +2201,9 @@ function App() {
   const [seamHeight, setSeamHeight] = useState(34);
   const [seamInset, setSeamInset] = useState(0);
   const [status, setStatus] = useState('请先添加主体并上传 PDF。');
+  const [statusFlash, setStatusFlash] = useState(0);
+  const [stampFlashId, setStampFlashId] = useState<string | null>(null);
+  const stampFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -2073,6 +2252,20 @@ function App() {
   useEffect(() => {
     actionsRef.current = actions;
   }, [actions]);
+
+  function flashStatus(message: string) {
+    setStatus(message);
+    setStatusFlash((n) => n + 1);
+  }
+
+  function triggerStampFlash(id: string) {
+    if (stampFlashTimerRef.current) clearTimeout(stampFlashTimerRef.current);
+    setStampFlashId(id);
+    stampFlashTimerRef.current = setTimeout(() => {
+      setStampFlashId(null);
+      stampFlashTimerRef.current = null;
+    }, 700);
+  }
 
   function replaceActions(nextActions: StampAction[]) {
     const cloned = cloneStampActions(nextActions);
@@ -2162,7 +2355,7 @@ function App() {
         setActiveSubjectId(nextActiveId);
         resetActionHistory(persisted?.actions || []);
         setRecords(persisted?.records || []);
-        setExportName(persisted?.exportName || '已盖章文件_已电子签章.pdf');
+        setExportName(persisted?.exportName || '已盖章文件【已签】.pdf');
         setColorTheme(persisted?.colorTheme || 'red');
         setSidebarCollapsed(Boolean(persisted?.sidebarCollapsed));
         if (persisted?.sidebarCollapsed) didAutoCollapseRef.current = true;
@@ -2706,6 +2899,7 @@ function App() {
       purpose: qualification.purpose,
       addSeal: qualification.addSeal,
       addWatermark: qualification.addWatermark,
+      watermarkScale: normalizeWatermarkScale(qualification.watermarkScale),
       sealPosition: qualification.sealPosition ?? 'br',
     });
   }
@@ -2722,12 +2916,14 @@ function App() {
       purpose: downloadConfig.purpose,
       addSeal: downloadConfig.addSeal,
       addWatermark: downloadConfig.addWatermark,
+      watermarkScale: downloadConfig.watermarkScale,
       sealPosition: downloadConfig.sealPosition,
     };
     updateQualification(downloadConfig.id, {
       purpose: downloadConfig.purpose,
       addSeal: downloadConfig.addSeal,
       addWatermark: downloadConfig.addWatermark,
+      watermarkScale: downloadConfig.watermarkScale,
       sealPosition: downloadConfig.sealPosition,
     });
     setDownloadConfig(null);
@@ -3154,7 +3350,8 @@ function App() {
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
         : [...list, nextAction]));
       setEditingActionId(null);
-      setStatus(`${editingActionId ? '已更新' : '已添加'} ${pages.length} 页${selectedSealLabel}，其中 ${nextOverrides ? Object.keys(nextOverrides).length : 0} 页使用单独位置。`);
+      flashStatus(`${editingActionId ? '已更新' : '已添加'} ${pages.length} 页${selectedSealLabel}，其中 ${nextOverrides ? Object.keys(nextOverrides).length : 0} 页使用单独位置。`);
+      if (!editingActionId) triggerStampFlash(id);
     }
     if (mode === 'specific') {
       const pages = parsePageList(specificPages, pageCount);
@@ -3168,7 +3365,8 @@ function App() {
         ? list.map((action) => (action.id === editingActionId ? nextAction : action))
         : [...list, nextAction]));
       setEditingActionId(null);
-      setStatus(`已${editingActionId ? '更新' : '添加'}第 ${pages.join('、')} 页${selectedSealLabel}。`);
+      flashStatus(`已${editingActionId ? '更新' : '添加'}第 ${pages.join('、')} 页${selectedSealLabel}。`);
+      if (!editingActionId) triggerStampFlash(id);
     }
     if (mode === 'seam') {
       const pages = rangePages(seamStart, seamEnd, pageCount);
@@ -3186,7 +3384,8 @@ function App() {
           ? [...list.filter((action) => !(action.type === 'seam' && samePages(action.pages, pages))), nextAction]
         : [...list, nextAction]));
       setEditingActionId(null);
-      setStatus(`已${editingActionId || existingSameRange ? '更新' : '添加'} ${pages.length} 份骑缝章。`);
+      flashStatus(`已${editingActionId || existingSameRange ? '更新' : '添加'} ${pages.length} 份骑缝章。`);
+      if (!editingActionId && !existingSameRange) triggerStampFlash(id);
     }
   }
 
@@ -3279,7 +3478,7 @@ function App() {
     const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    const fallbackName = pdfName ? defaultExportName(pdfName) : '已盖章文件_已电子签章.pdf';
+    const fallbackName = pdfName ? defaultExportName(pdfName) : '已盖章文件【已签】.pdf';
     const downloadName = normalizeExportName(exportName, fallbackName);
     link.download = downloadName;
     link.click();
@@ -3304,6 +3503,134 @@ function App() {
     };
     setRecords((list) => [newRecord, ...list].slice(0, 50));
     setStatus(`已导出并记录：${downloadName}`);
+  }
+
+  async function exportScannedPdf(level: ScanLevel) {
+    if (!pdfDocument || !activeSubject) {
+      setStatus('请先上传 PDF，并选择主体。');
+      return;
+    }
+    if (!actions.length) {
+      setStatus('还没有添加任何盖章操作。');
+      return;
+    }
+    const subject = activeSubject;
+    const preset = SCAN_PRESETS[level];
+    // 先校验所需印章齐全。
+    for (const action of actions) {
+      if (action.type === 'normal') {
+        if (!resolveStampVisual(action, subject)) {
+          const missingName = action.customSealId
+            ? (findCustomSeal(subject, action.customSealId)?.name || '自定义印章')
+            : sealLabels[action.sealKind];
+          setStatus(`当前主体缺少${missingName}，无法导出。`);
+          return;
+        }
+      } else if (!subject.seals.official) {
+        setStatus('当前主体缺少公章，无法导出骑缝章。');
+        return;
+      }
+    }
+    setStatus('正在生成扫描版，请稍候…');
+    try {
+      const imgCache = new Map<string, HTMLImageElement>();
+      const loadImg = async (key: string, src: string) => {
+        const cached = imgCache.get(key);
+        if (cached) return cached;
+        const img = await imageElement(src);
+        imgCache.set(key, img);
+        return img;
+      };
+      const sliceCache = new Map<number, string[]>();
+      const getSlices = async (count: number) => {
+        const cached = sliceCache.get(count);
+        if (cached) return cached;
+        const generated = await splitImageVertically(subject.seals.official || '', count);
+        sliceCache.set(count, generated);
+        return generated;
+      };
+      const newPdf = await PDFDocument.create();
+      for (let p = 1; p <= pageCount; p += 1) {
+        const page = await pdfDocument.getPage(p);
+        const base = page.getViewport({ scale: 1 });
+        const scale = Math.min(2, Math.max(1, 2200 / Math.max(base.width, base.height)));
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(viewport.width));
+        canvas.height = Math.max(1, Math.round(viewport.height));
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) continue;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        for (const action of actions) {
+          if (!action.pages.includes(p)) continue;
+          if (action.type === 'normal') {
+            const visual = resolveStampVisual(action, subject);
+            if (!visual) continue;
+            const key = action.customSealId ? `c:${action.customSealId}` : `k:${action.sealKind}`;
+            const img = await loadImg(key, visual.src);
+            const w = (canvas.width * visual.widthPercent) / 100;
+            const h = w * visual.aspect;
+            const pos = pagePosition(action, p);
+            ctx.drawImage(img, (canvas.width * pos.xPercent) / 100 - w / 2, (canvas.height * pos.yPercent) / 100 - h / 2, w, h);
+          } else {
+            const localIndex = action.pages.indexOf(p);
+            const { sliceIndex, groupSize } = seamSliceInfo(action.pages.length, action.splitCount, localIndex);
+            const slices = await getSlices(groupSize);
+            const slice = slices[sliceIndex];
+            if (!slice) continue;
+            const img = await loadImg(`seam:${action.id}:${groupSize}:${sliceIndex}`, slice);
+            const targetHeight = (canvas.width * sealSizePercent('official', action.heightPercent, subject.sealSizes)) / 100;
+            const targetWidth = targetHeight / groupSize;
+            const x = canvas.width - targetWidth + (canvas.width * action.rightInsetPercent) / 100;
+            const y = (canvas.height * action.yPercent) / 100;
+            ctx.drawImage(img, x, y, targetWidth, targetHeight);
+          }
+        }
+        applyScanEffect(ctx, canvas.width, canvas.height, preset);
+        const angle = (Math.random() * 2 - 1) * preset.angle;
+        const finalCanvas = rotateCanvasOntoPaper(canvas, angle, preset.paper);
+        const jpeg = await newPdf.embedJpg(dataUrlToBytes(finalCanvas.toDataURL('image/jpeg', preset.jpeg)));
+        const newPage = newPdf.addPage([base.width, base.height]);
+        newPage.drawImage(jpeg, { x: 0, y: 0, width: base.width, height: base.height });
+      }
+      const result = await newPdf.save();
+      const arrayBuffer = new ArrayBuffer(result.byteLength);
+      new Uint8Array(arrayBuffer).set(result);
+      const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      const fallbackName = pdfName ? defaultExportName(pdfName) : '已盖章文件【已签】.pdf';
+      const downloadName = normalizeExportName(exportName, fallbackName);
+      link.download = downloadName;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      setExportName(downloadName);
+      const recordDataUrl = await blobToDataUrl(blob);
+      const newRecord: ExportRecord = {
+        id: uid('record'),
+        kind: 'export',
+        name: downloadName,
+        subjectName: subject.name,
+        pageCount,
+        actionCount: actions.length,
+        createdAt: timestampText(),
+        dataUrl: recordDataUrl,
+      };
+      setRecords((list) => [newRecord, ...list].slice(0, 50));
+      setStatus(`已导出扫描版并记录：${downloadName}`);
+    } catch {
+      setStatus('生成扫描版失败，请重试或改用清晰版导出。');
+    }
+  }
+
+  function handleExport() {
+    if (scanMode === 'off') {
+      exportPdf();
+      return;
+    }
+    exportScannedPdf(scanMode);
   }
 
   function redownloadRecord(record: ExportRecord) {
@@ -3418,6 +3745,7 @@ function App() {
           purpose: qualification.purpose,
           addSeal: qualification.addSeal,
           addWatermark: qualification.addWatermark,
+          watermarkScale: qualification.watermarkScale,
           sealPosition: qualification.sealPosition,
         });
       });
@@ -3469,6 +3797,7 @@ function App() {
             purpose: qualification.purpose,
             addSeal: qualification.addSeal,
             addWatermark: qualification.addWatermark,
+            watermarkScale: normalizeWatermarkScale(qualification.watermarkScale),
             sealPosition: qualification.sealPosition,
           };
         });
@@ -3679,17 +4008,30 @@ function App() {
         <div className="topbar-spacer" />
 
         <div className="topbar-export-group">
-          <input
-            className="topbar-export-input"
-            value={exportName}
-            onChange={(event) => setExportName(event.target.value)}
-            placeholder="导出文件名.pdf"
-            title="导出文件名"
-          />
-          <button className="button primary topbar-export-btn" onClick={exportPdf}>
-            <Download size={16} />
-            导出
-          </button>
+          <select
+            className="topbar-scan-select"
+            value={scanMode}
+            onChange={(event) => setScanMode(event.target.value as 'off' | ScanLevel)}
+            title="导出模式：清晰版 或 模拟扫描件"
+          >
+            <option value="off">清晰版</option>
+            <option value="light">扫描·轻</option>
+            <option value="medium">扫描·中</option>
+            <option value="strong">扫描·强</option>
+          </select>
+          <div className="topbar-export-join">
+            <input
+              className="topbar-export-input"
+              value={exportName}
+              onChange={(event) => setExportName(event.target.value)}
+              placeholder="导出文件名.pdf"
+              title="导出文件名"
+            />
+            <button className="button primary topbar-export-btn" onClick={handleExport}>
+              <Download size={16} />
+              导出
+            </button>
+          </div>
         </div>
 
         <button className="icon-button topbar-logout" onClick={handleLogout} title="退出">
@@ -4279,11 +4621,12 @@ function App() {
                         const width = (renderPage.width * visual.widthPercent) / 100;
                         const height = width * visual.aspect;
                         const position = pagePosition(action, currentPage);
+                        const isFlashing = stampFlashId === action.id;
                         if (action.customSealId) {
                           return (
                             <div
                               key={action.id}
-                              className={`stamp-preview custom-stamp-preview interactive-stamp-preview ${resizingActionId === action.id ? 'resizing' : ''}`}
+                              className={`stamp-preview custom-stamp-preview interactive-stamp-preview ${resizingActionId === action.id ? 'resizing' : ''}${isFlashing ? ' stamp-flash' : ''}`}
                               onPointerDown={(event) => startExistingStampPositioning(event, action)}
                               style={{
                                 width,
@@ -4304,7 +4647,7 @@ function App() {
                         return (
                           <img
                             key={action.id}
-                            className="stamp-preview interactive-stamp-preview"
+                            className={`stamp-preview interactive-stamp-preview${isFlashing ? ' stamp-flash' : ''}`}
                             src={visual.src}
                             alt="stamp"
                             draggable={false}
@@ -4324,10 +4667,11 @@ function App() {
                       const slice = seamSliceInfo(action.pages.length, action.splitCount, localIndex);
                       const previewHeight = (renderPage.width * sealSizePercent('official', action.heightPercent, activeSubject.sealSizes)) / 100;
                       const width = Math.max(12, previewHeight / slice.groupSize);
+                      const isSeamFlashing = stampFlashId === action.id;
                       return (
                         <div
                           key={action.id}
-                          className="seam-preview"
+                          className={`seam-preview${isSeamFlashing ? ' stamp-flash' : ''}`}
                           style={{
                             width,
                             height: previewHeight,
@@ -4550,7 +4894,7 @@ function App() {
           </section>
         )}
 
-        <div className="status">{status}</div>
+        <div key={statusFlash} className="status status-flash">{status}</div>
       </aside>
       {confirmDialog && (
         <ConfirmDialog dialog={confirmDialog} onResolve={resolveConfirmDialog} />
@@ -4592,15 +4936,19 @@ function App() {
         <div className="preview-layer" role="presentation" onMouseDown={() => setDownloadConfig(null)}>
           <section className="download-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
             <header className="download-dialog-head">
-              <strong>下载设置</strong>
+              <strong>
+                下载设置
+                <span className="download-dialog-filename" title={downloadConfig.name}>
+                  {downloadConfig.name.length > 10 ? `${downloadConfig.name.slice(0, 10)}...` : downloadConfig.name}
+                </span>
+              </strong>
               <button className="icon-button" aria-label="关闭" onClick={() => setDownloadConfig(null)}>
                 <X size={16} />
               </button>
             </header>
             <div className="download-dialog-body">
-              <div className="download-file-name" title={downloadConfig.name}>{downloadConfig.name}</div>
               <label className="download-field">
-                <span>用途（自定义内容）</span>
+                <span>用途</span>
                 <textarea
                   rows={3}
                   value={downloadConfig.purpose}
@@ -4618,7 +4966,18 @@ function App() {
               </label>
               {downloadConfig.addSeal && (
                 <div className="download-field download-seal-position">
-                  <span>公章位置</span>
+                  {downloadTarget && (
+                    <>
+                      <SealPositionPreview
+                        qualification={downloadTarget}
+                        sealDataUrl={activeSubject?.seals.official}
+                        position={downloadConfig.sealPosition}
+                      />
+                      {!activeSubject?.seals.official && (
+                        <span className="seal-preview-warning">当前主体尚未上传公章，下载时不会盖章。</span>
+                      )}
+                    </>
+                  )}
                   <div className="seal-position-grid">
                     {(['tl', 'tr', 'center', 'bl', 'br'] as SealPosition[]).map((pos) => (
                       <button
@@ -4631,19 +4990,6 @@ function App() {
                       </button>
                     ))}
                   </div>
-                  {downloadTarget && (
-                    <>
-                      <span className="seal-preview-hint">位置预览（仅示意，公章为半透明叠加）</span>
-                      <SealPositionPreview
-                        qualification={downloadTarget}
-                        sealDataUrl={activeSubject?.seals.official}
-                        position={downloadConfig.sealPosition}
-                      />
-                      {!activeSubject?.seals.official && (
-                        <span className="seal-preview-warning">当前主体尚未上传公章，下载时不会盖章。</span>
-                      )}
-                    </>
-                  )}
                 </div>
               )}
               <label className="download-toggle">
@@ -4654,9 +5000,22 @@ function App() {
                 />
                 <span>加水印（用途内容 + 时间戳）</span>
               </label>
+              {downloadConfig.addWatermark && (
+                <div className="watermark-scale-row" role="group" aria-label="水印大小与密度">
+                  {WATERMARK_SCALE_LIST.map((scale) => (
+                    <button
+                      key={scale}
+                      type="button"
+                      className={`seal-position-option ${downloadConfig.watermarkScale === scale ? 'active' : ''}`}
+                      onClick={() => setDownloadConfig((config) => (config ? { ...config, watermarkScale: scale } : config))}
+                    >
+                      {WATERMARK_SCALE_LABELS[scale]}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
             <footer className="download-dialog-foot">
-              <button className="button" onClick={() => setDownloadConfig(null)}>取消</button>
               <button className="button primary" onClick={confirmDownloadConfig}>
                 <Download size={15} />
                 确认下载
